@@ -4120,8 +4120,11 @@ ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
 
     asb_log(L"Taking snapshot \"%s\" of VM \"%s\"...", snap_name, g_vms[idx].name);
     hr = snapshot_take(&g_snap_trees[idx], &g_vms[idx], snap_name);
-    if (FAILED(hr))
+    if (FAILED(hr)) {
         asb_log(L"Error: Snapshot failed (0x%08X)", hr);
+        if (hr == E_NOT_VALID_STATE)
+            asb_alert(L"Cannot take a snapshot: the VM's current disk is not part of its snapshot tree.");
+    }
     else
         asb_log(L"Snapshot \"%s\" created.", snap_name);
 
@@ -4139,7 +4142,10 @@ ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
 
     asb_log(L"Deleting snapshot %d...", snap_idx);
     hr = snapshot_delete(&g_snap_trees[idx], &g_vms[idx], snap_idx);
-    if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
+    if (hr == SNAPSHOT_E_HAS_DEPENDENTS) {
+        asb_log(L"Cannot delete snapshot: other snapshots were taken from it.");
+        asb_alert(L"Cannot delete this snapshot because other snapshots were taken from it. Delete those first.");
+    } else if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
     else asb_log(L"Snapshot deleted.");
 
     save_vm_list();
@@ -4172,7 +4178,10 @@ ASB_API HRESULT asb_snap_delete_branch(AsbVm vm, int snap_idx, int branch_idx)
               : (snap_idx >= 0 && snap_idx < g_snap_trees[idx].count
                    ? g_snap_trees[idx].nodes[snap_idx].name : L"?"));
     hr = snapshot_delete_branch(&g_snap_trees[idx], &g_vms[idx], snap_idx, branch_idx);
-    if (FAILED(hr)) asb_log(L"Error: Failed to delete branch (0x%08X)", hr);
+    if (hr == SNAPSHOT_E_HAS_DEPENDENTS) {
+        asb_log(L"Cannot delete branch: another snapshot is built on it.");
+        asb_alert(L"Cannot delete this branch because another snapshot is built on it.");
+    } else if (FAILED(hr)) asb_log(L"Error: Failed to delete branch (0x%08X)", hr);
     else asb_log(L"Branch deleted.");
 
     save_vm_list();

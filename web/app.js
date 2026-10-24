@@ -1567,7 +1567,7 @@ function renderSnapshotModal() {
         addBranches(children, vm.baseBranches || [], 'base-');
         (vm.snapshots || []).forEach(function(snap, i) {
             var item = addChoice(children, String(i), snap.name,
-                (snap.date ? 'Created ' + snap.date + ' · ' : '') + 'New branch on start');
+                (snap.date ? 'Created ' + snap.date + ' · ' : '') + (snap.parent ? 'From ' + snap.parent + ' · ' : '') + 'New branch on start');
             var branches = document.createElement('ul');
             item.appendChild(branches);
             addBranches(branches, snap.branches || [], i + '-');

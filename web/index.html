@@ -15,7 +15,10 @@
 <section id="vm-section">
     <div class="section-header">
         <h2>Sandboxes</h2>
-        <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+        <div class="section-actions">
+            <button id="btn-settings" class="win-only" onclick="openSettingsModal()">Settings</button>
+            <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+        </div>
     </div>
     <div class="vm-table-wrap">
         <table id="vm-table">
@@ -234,6 +237,35 @@
         <div class="modal-buttons">
             <button onclick="closeEditVmModal()">Cancel</button>
             <button id="btn-save-edit-vm" class="primary" onclick="saveEditVm()">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- General settings modal -->
+<div class="modal-overlay" id="settings-overlay">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <h3 id="settings-title">General Settings</h3>
+        <div class="modal-form-body">
+            <h4 class="settings-group">Viewer window</h4>
+            <div class="form-grid">
+                <label for="viewer-window-mode">Open as:</label>
+                <div class="form-row">
+                    <select id="viewer-window-mode">
+                        <option value="0">Window</option>
+                        <option value="1">Borderless fullscreen</option>
+                    </select>
+                </div>
+
+                <span></span>
+                <div class="form-row">
+                    <label title="Reopen the viewer with the size and position it had when you last closed it"><input type="checkbox" id="viewer-remember-placement"> Remember window size and position</label>
+                </div>
+            </div>
+            <p class="settings-note">Toggle fullscreen in the viewer with Ctrl+Alt+Enter or the title bar menu. The guest picture is scaled to fit the window, keeping its aspect ratio.</p>
+        </div>
+        <div class="modal-buttons">
+            <button onclick="closeSettingsModal()">Cancel</button>
+            <button id="btn-save-settings" class="primary" onclick="saveSettings()">Save</button>
         </div>
     </div>
 </div>

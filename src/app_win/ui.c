@@ -519,6 +519,22 @@ static void send_templates(void)
     webview2_post(buf);
 }
 
+static void send_viewer_settings(void)
+{
+    wchar_t buf[256];
+    JsonBuilder jb;
+    VmDisplayIddSettings settings;
+
+    vm_display_idd_get_settings(&settings);
+    jb_init(&jb, buf, ARRAYSIZE(buf));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"viewerSettings");
+    jb_int(&jb, L"windowMode", settings.window_mode);
+    jb_bool(&jb, L"rememberPlacement", settings.remember_placement);
+    jb_object_end(&jb);
+    webview2_post(buf);
+}
+
 static int CALLBACK disk_folder_browse_callback(HWND hwnd, UINT message, LPARAM lp, LPARAM data)
 {
     (void)lp;
@@ -1324,6 +1340,14 @@ static void on_webview2_message(const wchar_t *json)
         prereq_reboot();
     } else if (wcscmp(action, L"getState") == 0) {
         send_full_state();
+    } else if (wcscmp(action, L"getViewerSettings") == 0) {
+        send_viewer_settings();
+    } else if (wcscmp(action, L"setViewerSettings") == 0) {
+        VmDisplayIddSettings settings;
+        vm_display_idd_get_settings(&settings);
+        json_get_int(json, L"windowMode", &settings.window_mode);
+        json_get_bool(json, L"rememberPlacement", &settings.remember_placement);
+        vm_display_idd_set_settings(&settings);
     } else if (wcscmp(action, L"setMinSize") == 0) {
         int cw = 0, ch = 0;
         json_get_int(json, L"width", &cw);

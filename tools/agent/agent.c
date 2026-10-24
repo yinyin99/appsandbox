@@ -395,6 +395,70 @@ static BOOL logoff_session(DWORD session_id)
     return result;
 }
 
+/* SendSAS from a service is honoured only when the SoftwareSASGeneration policy
+   has the "services" bit (1) set; absent/0 disables it. Set that bit (0 -> 1,
+   2 -> 3 keeps the ease-of-access bit) before sending. */
+static BOOL ensure_sas_policy(void)
+{
+    HKEY key;
+    DWORD value = 0, size = sizeof(value), type = 0, wanted;
+    LONG rc;
+
+    rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+                         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                         0, NULL, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL);
+    if (rc != ERROR_SUCCESS) {
+        agent_log("SendSAS: cannot open Policies\\System (%ld).", rc);
+        return FALSE;
+    }
+    if (RegQueryValueExW(key, L"SoftwareSASGeneration", NULL, &type,
+                         (BYTE *)&value, &size) != ERROR_SUCCESS || type != REG_DWORD)
+        value = 0;
+    wanted = value | 1;
+    if (wanted != value) {
+        rc = RegSetValueExW(key, L"SoftwareSASGeneration", 0, REG_DWORD,
+                            (const BYTE *)&wanted, sizeof(wanted));
+        if (rc != ERROR_SUCCESS)
+            agent_log("SendSAS: cannot set SoftwareSASGeneration (%ld).", rc);
+        else
+            agent_log("SendSAS: SoftwareSASGeneration %lu -> %lu.", value, wanted);
+    }
+    RegCloseKey(key);
+    return rc == ERROR_SUCCESS;
+}
+
+/* Send the Secure Attention Sequence (Ctrl+Alt+Del) to the console session via
+   sas.dll!SendSAS. AsUser=FALSE is the service-context form: it works because
+   the agent runs as a Windows service. SendSAS cannot be synthesized with
+   SendInput, so this is the only way for the host to deliver Ctrl+Alt+Del. */
+static BOOL send_sas(void)
+{
+    typedef VOID (WINAPI *PFN_SendSAS)(BOOL);
+
+    HMODULE sas;
+    PFN_SendSAS pfnSendSAS;
+
+    if (!ensure_sas_policy()) return FALSE;
+
+    sas = LoadLibraryW(L"sas.dll");
+    if (!sas) {
+        agent_log("SendSAS: LoadLibrary(sas.dll) failed (%lu).", GetLastError());
+        return FALSE;
+    }
+
+    pfnSendSAS = (PFN_SendSAS)GetProcAddress(sas, "SendSAS");
+    if (!pfnSendSAS) {
+        agent_log("SendSAS: export not found (%lu).", GetLastError());
+        FreeLibrary(sas);
+        return FALSE;
+    }
+
+    pfnSendSAS(FALSE);
+    agent_log("SendSAS: Secure Attention Sequence sent.");
+    FreeLibrary(sas);
+    return TRUE;
+}
+
 /* Run a command hidden and wait for it (used for takeown/icacls). The cmd buffer
    must be writable (CreateProcessW may modify it). */
 static DWORD run_quiet(wchar_t *cmd)
@@ -2125,6 +2189,9 @@ static void handle_client(AsbConn *client)
         }
         else if (strcmp(cmd, "idd_connect") == 0) {
             handle_idd_connect(client, tag);
+        }
+        else if (strcmp(cmd, "send_sas") == 0) {
+            REPLY(send_sas() ? "ok" : "error:sas_failed");
         }
         else {
             REPLY("error:unknown");

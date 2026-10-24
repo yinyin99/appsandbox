@@ -151,6 +151,7 @@ window.onHostMessage = function(msg) {
         case 'prereqReboot':   onPrereqReboot(); break;
         case 'prereqProgress': onPrereqProgress(msg); break;
         case 'prereqResult':   onPrereqResult(msg); break;
+        case 'viewerSettings': onViewerSettings(msg); break;
     }
 };
 
@@ -907,6 +908,12 @@ document.addEventListener('keydown', function(e) {
         } else trapModalFocus(e, editOverlay);
         return;
     }
+    var settingsOverlay = document.getElementById('settings-overlay');
+    if (settingsOverlay.classList.contains('active')) {
+        if (e.key === 'Escape') { e.preventDefault(); closeSettingsModal(); }
+        else trapModalFocus(e, settingsOverlay);
+        return;
+    }
     var snapshotOverlay = document.getElementById('snapshot-overlay');
     if (snapshotOverlay.classList.contains('active')) {
         if (e.key === 'Escape') { e.preventDefault(); closeSnapshotModal(); }
@@ -1302,6 +1309,48 @@ document.getElementById('edit-ram-size').addEventListener('change', function() {
         backdropPress = false;
     });
 });
+
+/* ---- General settings ---- */
+
+var settingsPreviousFocus = null;
+
+function openSettingsModal() {
+    settingsPreviousFocus = document.activeElement;
+    document.getElementById('settings-overlay').classList.add('active');
+    document.getElementById('viewer-window-mode').focus();
+    sendCmd('getViewerSettings');
+}
+
+function closeSettingsModal() {
+    document.getElementById('settings-overlay').classList.remove('active');
+    var target = settingsPreviousFocus && settingsPreviousFocus.isConnected
+        ? settingsPreviousFocus : document.getElementById('btn-settings');
+    target.focus();
+    settingsPreviousFocus = null;
+}
+
+function onViewerSettings(msg) {
+    document.getElementById('viewer-window-mode').value = String(msg.windowMode);
+    document.getElementById('viewer-remember-placement').checked = !!msg.rememberPlacement;
+}
+
+function saveSettings() {
+    sendCmd('setViewerSettings', {
+        windowMode: Number(document.getElementById('viewer-window-mode').value),
+        rememberPlacement: document.getElementById('viewer-remember-placement').checked
+    });
+    closeSettingsModal();
+}
+
+(function() {
+    var backdropPress = false;
+    var overlay = document.getElementById('settings-overlay');
+    overlay.addEventListener('mousedown', function(e) { backdropPress = e.target === overlay; });
+    overlay.addEventListener('click', function(e) {
+        if (backdropPress && e.target === overlay) closeSettingsModal();
+        backdropPress = false;
+    });
+})();
 
 /* ---- Force Stop VM ---- */
 

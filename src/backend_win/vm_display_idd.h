@@ -19,4 +19,20 @@ BOOL vm_display_idd_is_open(VmDisplayIdd *display);
    Safe to call from any thread; the work is marshaled to the window thread. */
 void vm_display_idd_focus(VmDisplayIdd *display);
 
+/* Viewer window modes for VmDisplayIddSettings.window_mode. */
+#define VIEWER_WINDOW_WINDOWED    0
+#define VIEWER_WINDOW_FULLSCREEN  1   /* borderless popup covering the monitor */
+
+/* Application-wide viewer preferences, persisted in
+   %ProgramData%\AppSandbox\viewer_settings.json and applied when a viewer
+   window opens. remember_placement restores the windowed size/position the
+   viewer had when it last closed. */
+typedef struct {
+    int  window_mode;
+    BOOL remember_placement;
+} VmDisplayIddSettings;
+
+void vm_display_idd_get_settings(VmDisplayIddSettings *out);
+void vm_display_idd_set_settings(const VmDisplayIddSettings *settings);
+
 #endif /* VM_DISPLAY_IDD_H */

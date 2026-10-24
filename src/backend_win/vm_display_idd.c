@@ -28,6 +28,7 @@
 #pragma warning(pop)
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 
 #include "vm_display_idd.h"
@@ -113,10 +114,16 @@ typedef struct AudioFrameHeader {
 #define WM_IDD_FOCUS            (WM_USER + 101)
 #define WM_IDD_INPUT_READY      (WM_USER + 102)
 #define WM_IDD_CURSOR_CHANGED   (WM_USER + 103)
+#define WM_IDD_HOTKEY           (WM_USER + 104)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
+
+/* Fullscreen connection bar: poll the cursor, hide after the cursor left */
+#define IDT_BAR         2002
+#define BAR_POLL_MS     50
+#define BAR_HIDE_MS     1000
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -244,6 +251,23 @@ struct VmDisplayIdd {
     BYTE           hook_routes[768];
     BOOL           input_menu_active;
 
+    /* Host hotkeys (Ctrl+Alt+Enter fullscreen, Ctrl+Alt+End Ctrl+Alt+Del) */
+    DWORD          hotkey_vk;       /* hotkey key currently held; its key-up is swallowed */
+    BYTE           hotkey_mods;     /* HOTKEY_MOD_* currently held, tracked from key events */
+
+    /* Fullscreen (borderless popup covering the monitor) */
+    BOOL             fullscreen;
+    WINDOWPLACEMENT  windowed_placement; /* restored when leaving fullscreen */
+
+    /* Fullscreen connection bar (owned popup at the top centre of the monitor) */
+    HWND             bar_hwnd;
+    BOOL             bar_pinned;     /* persisted in viewer_settings.json */
+    int              bar_hover;      /* BAR_BTN_* under the cursor, -1 none */
+    UINT             bar_dpi;        /* DPI the bar fonts/size were built for */
+    int              bar_w, bar_h;
+    HFONT            bar_font, bar_icon_font;
+    ULONGLONG        bar_leave_tick; /* last time the cursor was on the bar/hot zone */
+
     /* Guest cursor */
     HCURSOR        guest_cursor;    /* current cursor created from guest bitmap */
     UINT32         cursor_shape_id; /* tracks which shape is current */
@@ -283,11 +307,17 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
 static const wchar_t *IDD_DISPLAY_CLASS = L"AppSandboxIddDisplay";
 static const wchar_t *IDD_RENDER_CLASS  = L"AppSandboxIddRender";
 static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
+static const wchar_t *IDD_BAR_CLASS     = L"AppSandboxIddBar";
+static LRESULT CALLBACK idd_bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 /* System menu command IDs — must be < 0xF000 and have low 4 bits clear */
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+#define IDM_FULLSCREEN     0x1030
+#define IDM_SEND_CAD       0x1040
+#define HOTKEY_MOD_CTRL    1
+#define HOTKEY_MOD_ALT     2
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -436,6 +466,15 @@ static void ensure_idd_class(HINSTANCE hInst)
     wc.hCursor       = NULL;
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = IDD_RENDER_CLASS;
+    RegisterClassExW(&wc);
+
+    /* Fullscreen connection bar */
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = idd_bar_proc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.lpszClassName = IDD_BAR_CLASS;
     RegisterClassExW(&wc);
 
     /* Separate log window — dark background to match AppSandbox main window */
@@ -682,6 +721,129 @@ static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path)
 }
 
 /* ==================================================================
+ * Viewer preferences (%ProgramData%\AppSandbox\viewer_settings.json)
+ *
+ * Application-wide, shared by every viewer window; the UI edits the
+ * public VmDisplayIddSettings part, the windows record the windowed
+ * placement they had on close.
+ * ================================================================== */
+
+typedef struct {
+    VmDisplayIddSettings settings;
+    RECT                 placement;  /* WINDOWPLACEMENT.rcNormalPosition; empty = none saved */
+    BOOL                 bar_pinned; /* fullscreen connection bar stays visible */
+} IddViewerPrefs;
+
+static SRWLOCK g_viewer_prefs_lock = SRWLOCK_INIT;
+
+static void idd_viewer_prefs_dir(wchar_t *out, size_t out_chars)
+{
+    wchar_t base[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH);
+    if (!n || n >= MAX_PATH)
+        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(out, out_chars, L"%s\\AppSandbox", base);
+}
+
+static BOOL idd_json_int(const char *json, const char *key, int *out)
+{
+    char pattern[32];
+    const char *p;
+    sprintf_s(pattern, sizeof(pattern), "\"%s\":", key);
+    p = strstr(json, pattern);
+    if (!p) return FALSE;
+    *out = atoi(p + strlen(pattern));
+    return TRUE;
+}
+
+static void idd_viewer_prefs_load(IddViewerPrefs *p)
+{
+    wchar_t dir[MAX_PATH], path[MAX_PATH];
+    char buf[512];
+    FILE *f;
+    int v;
+
+    ZeroMemory(p, sizeof(*p));
+    idd_viewer_prefs_dir(dir, MAX_PATH);
+    swprintf_s(path, MAX_PATH, L"%s\\viewer_settings.json", dir);
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    if (fgets(buf, sizeof(buf), f)) {
+        if (idd_json_int(buf, "windowMode", &v) && v == VIEWER_WINDOW_FULLSCREEN)
+            p->settings.window_mode = VIEWER_WINDOW_FULLSCREEN;
+        if (idd_json_int(buf, "rememberPlacement", &v))
+            p->settings.remember_placement = v != 0;
+        if (idd_json_int(buf, "left", &v))   p->placement.left = v;
+        if (idd_json_int(buf, "top", &v))    p->placement.top = v;
+        if (idd_json_int(buf, "right", &v))  p->placement.right = v;
+        if (idd_json_int(buf, "bottom", &v)) p->placement.bottom = v;
+        if (idd_json_int(buf, "barPinned", &v)) p->bar_pinned = v != 0;
+    }
+    fclose(f);
+}
+
+static void idd_viewer_prefs_save(const IddViewerPrefs *p)
+{
+    wchar_t dir[MAX_PATH], path[MAX_PATH];
+    FILE *f;
+
+    idd_viewer_prefs_dir(dir, MAX_PATH);
+    CreateDirectoryW(dir, NULL);
+    swprintf_s(path, MAX_PATH, L"%s\\viewer_settings.json", dir);
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fprintf(f, "{\"windowMode\":%d,\"rememberPlacement\":%d,\"barPinned\":%d,"
+               "\"left\":%ld,\"top\":%ld,\"right\":%ld,\"bottom\":%ld}\n",
+            p->settings.window_mode, p->settings.remember_placement ? 1 : 0,
+            p->bar_pinned ? 1 : 0,
+            p->placement.left, p->placement.top, p->placement.right, p->placement.bottom);
+    fclose(f);
+}
+
+static void idd_viewer_prefs_save_pinned(BOOL pinned)
+{
+    IddViewerPrefs p;
+    AcquireSRWLockExclusive(&g_viewer_prefs_lock);
+    idd_viewer_prefs_load(&p);
+    p.bar_pinned = pinned;
+    idd_viewer_prefs_save(&p);
+    ReleaseSRWLockExclusive(&g_viewer_prefs_lock);
+}
+
+void vm_display_idd_get_settings(VmDisplayIddSettings *out)
+{
+    IddViewerPrefs p;
+    AcquireSRWLockShared(&g_viewer_prefs_lock);
+    idd_viewer_prefs_load(&p);
+    ReleaseSRWLockShared(&g_viewer_prefs_lock);
+    *out = p.settings;
+}
+
+void vm_display_idd_set_settings(const VmDisplayIddSettings *settings)
+{
+    IddViewerPrefs p;
+    AcquireSRWLockExclusive(&g_viewer_prefs_lock);
+    idd_viewer_prefs_load(&p);
+    p.settings.window_mode = settings->window_mode == VIEWER_WINDOW_FULLSCREEN
+                             ? VIEWER_WINDOW_FULLSCREEN : VIEWER_WINDOW_WINDOWED;
+    p.settings.remember_placement = settings->remember_placement;
+    idd_viewer_prefs_save(&p);
+    ReleaseSRWLockExclusive(&g_viewer_prefs_lock);
+}
+
+/* Record the windowed placement of a closing viewer, if the user asked to
+   remember it. */
+static void idd_viewer_prefs_save_placement(const WINDOWPLACEMENT *wp)
+{
+    IddViewerPrefs p;
+    AcquireSRWLockExclusive(&g_viewer_prefs_lock);
+    idd_viewer_prefs_load(&p);
+    if (p.settings.remember_placement) {
+        p.placement = wp->rcNormalPosition;
+        idd_viewer_prefs_save(&p);
+    }
+    ReleaseSRWLockExclusive(&g_viewer_prefs_lock);
+}
+
+/* ==================================================================
  * Keyboard hotkey capture
  * ================================================================== */
 
@@ -765,6 +927,7 @@ static void idd_flush_held_keys(VmDisplayIdd *d)
         }
     }
     ReleaseSRWLockExclusive(&d->input_lock);
+    d->hotkey_mods = 0;
 }
 
 /* Thread-local owner: a WH_KEYBOARD_LL callback runs on the thread that
@@ -780,6 +943,39 @@ static BOOL idd_is_modifier(DWORD vk)
            (vk >= VK_LSHIFT && vk <= VK_RMENU);
 }
 
+static BOOL idd_is_windows_guest(const VmDisplayIdd *d)
+{
+    return wcscmp(d->os_type, L"Windows") == 0;
+}
+
+/* Host hotkeys, never forwarded to the guest: Ctrl+Alt+Enter toggles
+   fullscreen; Ctrl+Alt+End sends Ctrl+Alt+Del (Windows guests only). Returns
+   TRUE when the key event belongs to one and must be swallowed. The action
+   runs on the window procedure via WM_IDD_HOTKEY. */
+static BOOL idd_host_hotkey(VmDisplayIdd *d, DWORD vk, BOOL up)
+{
+    /* Ctrl/Alt are tracked here, not with GetAsyncKeyState: Transmit mode
+       swallows modifiers in the hook, so the OS key state never sees them. */
+    BYTE mod = (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) ? HOTKEY_MOD_CTRL :
+               (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) ? HOTKEY_MOD_ALT : 0;
+    if (mod) {
+        if (up) d->hotkey_mods &= ~mod; else d->hotkey_mods |= mod;
+        return FALSE;
+    }
+    if (up) {
+        if (d->hotkey_vk != vk) return FALSE;
+        d->hotkey_vk = 0;
+        return TRUE;
+    }
+    if (d->hotkey_vk == vk) return TRUE;  /* auto-repeat */
+    if (!((vk == VK_RETURN) || (vk == VK_END && idd_is_windows_guest(d))) ||
+        d->hotkey_mods != (HOTKEY_MOD_CTRL | HOTKEY_MOD_ALT))
+        return FALSE;
+    d->hotkey_vk = vk;
+    PostMessageW(d->hwnd, WM_IDD_HOTKEY, vk, 0);
+    return TRUE;
+}
+
 static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
 {
     VmDisplayIdd *d = t_hook_display;
@@ -788,6 +984,8 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
         BOOL up = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
         BOOL ext = (k->flags & LLKHF_EXTENDED) != 0;
         BOOL focused = d->input_focused && GetForegroundWindow() == d->hwnd;
+        if (focused && !d->input_menu_active && idd_host_hotkey(d, k->vkCode, up))
+            return 1;
         if (d->keyboard_version != INPUT_KEYBOARD_VERSION) {
             if (focused && d->transmit_hotkeys) {
                 idd_forward_key(d, k->vkCode, k->scanCode, ext, up);
@@ -863,6 +1061,281 @@ static void idd_update_kbd_hook(VmDisplayIdd *d)
         idd_install_kbd_hook(d);
     else
         idd_remove_kbd_hook(d);
+}
+
+/* ==================================================================
+ * Fullscreen connection bar: VM name, pin, minimize, exit fullscreen.
+ * A separate owned popup rather than a child of render_hwnd so it
+ * composes over the flip-model swap chain; WS_EX_NOACTIVATE keeps
+ * keyboard focus in the viewer and its clicks never reach the guest.
+ * ================================================================== */
+
+enum { BAR_BTN_PIN, BAR_BTN_MIN, BAR_BTN_EXIT, BAR_BTN_COUNT };
+
+#define BAR_PX(d, px) MulDiv((px), (int)(d)->bar_dpi, 96)
+
+/* Size the bar for the current DPI and centre it on the viewer's monitor. */
+static void idd_bar_layout(VmDisplayIdd *d)
+{
+    MONITORINFO mi = { sizeof(mi) };
+    UINT dpi = GetDpiForWindow(d->hwnd);
+    SIZE sz = { 0, 0 };
+    HDC dc;
+    HGDIOBJ old;
+    int name_w;
+
+    if (!GetMonitorInfoW(MonitorFromWindow(d->hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    if (dpi != d->bar_dpi) {
+        if (d->bar_font) DeleteObject(d->bar_font);
+        if (d->bar_icon_font) DeleteObject(d->bar_icon_font);
+        d->bar_dpi = dpi;
+        d->bar_font = CreateFontW(-BAR_PX(d, 13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                  CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        d->bar_icon_font = CreateFontW(-BAR_PX(d, 12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                       CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
+    }
+    dc = GetDC(d->bar_hwnd);
+    old = SelectObject(dc, d->bar_font);
+    GetTextExtentPoint32W(dc, d->vm_name, (int)wcslen(d->vm_name), &sz);
+    SelectObject(dc, old);
+    ReleaseDC(d->bar_hwnd, dc);
+    name_w = sz.cx < BAR_PX(d, 240) ? sz.cx : BAR_PX(d, 240);
+    d->bar_w = BAR_PX(d, 24) + name_w + BAR_BTN_COUNT * BAR_PX(d, 40);
+    d->bar_h = BAR_PX(d, 30);
+    SetWindowPos(d->bar_hwnd, NULL, (mi.rcMonitor.left + mi.rcMonitor.right - d->bar_w) / 2,
+                 mi.rcMonitor.top, d->bar_w, d->bar_h, SWP_NOACTIVATE | SWP_NOZORDER);
+    InvalidateRect(d->bar_hwnd, NULL, FALSE);
+}
+
+static void idd_bar_show(VmDisplayIdd *d, BOOL show)
+{
+    if (!d->bar_hwnd || show == IsWindowVisible(d->bar_hwnd)) return;
+    d->bar_hover = -1;
+    ShowWindow(d->bar_hwnd, show ? SW_SHOWNOACTIVATE : SW_HIDE);
+}
+
+static void idd_bar_destroy(VmDisplayIdd *d)
+{
+    if (d->bar_hwnd) DestroyWindow(d->bar_hwnd);
+    if (d->bar_font) DeleteObject(d->bar_font);
+    if (d->bar_icon_font) DeleteObject(d->bar_icon_font);
+    d->bar_hwnd = NULL;
+    d->bar_font = d->bar_icon_font = NULL;
+    d->bar_dpi = 0;
+}
+
+/* Button under client x, or -1 over the name. */
+static int idd_bar_hit(const VmDisplayIdd *d, int x)
+{
+    int first = d->bar_w - BAR_BTN_COUNT * BAR_PX(d, 40);
+    return x < first || x >= d->bar_w ? -1 : (x - first) / BAR_PX(d, 40);
+}
+
+static void idd_bar_paint(VmDisplayIdd *d)
+{
+    static const wchar_t glyphs[BAR_BTN_COUNT] = { 0xE718, 0xE921, 0xE923 };  /* Pin, Minimize, BackToWindow */
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(d->bar_hwnd, &ps);
+    HGDIOBJ brush = GetStockObject(DC_BRUSH);
+    int btn = BAR_PX(d, 40), first = d->bar_w - BAR_BTN_COUNT * btn;
+    RECT rc, br;
+    int i;
+
+    GetClientRect(d->bar_hwnd, &rc);
+    SetDCBrushColor(dc, RGB(32, 32, 32));  /* matches the dark title bar */
+    FillRect(dc, &rc, (HBRUSH)brush);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(230, 230, 230));
+    SelectObject(dc, d->bar_font);
+    SetRect(&br, BAR_PX(d, 12), 0, first, rc.bottom);
+    DrawTextW(dc, d->vm_name, -1, &br, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(dc, d->bar_icon_font);
+    for (i = 0; i < BAR_BTN_COUNT; i++) {
+        SetRect(&br, first + i * btn, 0, first + (i + 1) * btn, rc.bottom);
+        if ((i == BAR_BTN_PIN && d->bar_pinned) || i == d->bar_hover) {
+            SetDCBrushColor(dc, i == BAR_BTN_PIN && d->bar_pinned ? RGB(0, 95, 184) : RGB(64, 64, 64));
+            FillRect(dc, &br, (HBRUSH)brush);
+        }
+        DrawTextW(dc, &glyphs[i], 1, &br, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+    }
+    EndPaint(d->bar_hwnd, &ps);
+}
+
+static LRESULT CALLBACK idd_bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    VmDisplayIdd *d;
+
+    if (msg == WM_CREATE) {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW *)lp)->lpCreateParams);
+        return 0;
+    }
+    d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!d) return DefWindowProcW(hwnd, msg, wp, lp);
+
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        idd_bar_paint(d);
+        return 0;
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+        int hit = idd_bar_hit(d, (short)LOWORD(lp));
+        TrackMouseEvent(&tme);
+        if (hit != d->bar_hover) {
+            d->bar_hover = hit;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        d->bar_hover = -1;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_LBUTTONUP:
+        switch (idd_bar_hit(d, (short)LOWORD(lp))) {
+        case BAR_BTN_PIN:
+            d->bar_pinned = !d->bar_pinned;
+            idd_viewer_prefs_save_pinned(d->bar_pinned);
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case BAR_BTN_MIN:
+            ShowWindow(d->hwnd, SW_MINIMIZE);
+            break;
+        case BAR_BTN_EXIT:
+            /* Posted: leaving fullscreen destroys this window. */
+            PostMessageW(d->hwnd, WM_SYSCOMMAND, IDM_FULLSCREEN, 0);
+            break;
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* Show the bar when pinned, or while the cursor is on it / in the top-edge
+   hot zone above it; hide BAR_HIDE_MS after the cursor leaves. The hot zone
+   is inert while the guest owns the mouse (relative capture), a button is
+   held, or the viewer is not the active window. */
+static void idd_bar_tick(VmDisplayIdd *d)
+{
+    POINT pt;
+    RECT br;
+    ULONGLONG now = GetTickCount64();
+    BOOL show = d->bar_pinned;
+
+    if (!d->bar_hwnd) return;
+    if (!IsWindowVisible(d->hwnd) || IsIconic(d->hwnd) || !GetCursorPos(&pt)) {
+        idd_bar_show(d, FALSE);
+        return;
+    }
+    if (!show) {
+        BOOL visible = IsWindowVisible(d->bar_hwnd);
+        BOOL hot, usable;
+        GetWindowRect(d->bar_hwnd, &br);
+        hot = pt.x >= br.left && pt.x < br.right && pt.y >= br.top && pt.y < br.top + BAR_PX(d, 3);
+        usable = !d->relative_mouse && !d->input_menu_active && !d->mouse_buttons &&
+                 d->input_focused && GetForegroundWindow() == d->hwnd;
+        if ((hot && usable) || (visible && PtInRect(&br, pt))) {
+            d->bar_leave_tick = now;
+            show = TRUE;
+        } else {
+            show = visible && now - d->bar_leave_tick < BAR_HIDE_MS;
+        }
+    }
+    idd_bar_show(d, show);
+}
+
+/* Fit the borderless fullscreen window to the monitor it is currently on. */
+static void idd_fit_monitor(VmDisplayIdd *d)
+{
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(MonitorFromWindow(d->hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    SetWindowPos(d->hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                 mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top,
+                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    if (d->bar_hwnd) idd_bar_layout(d);
+}
+
+/* Switch between the normal framed window and a borderless WS_POPUP window
+   covering the current monitor. The windowed placement is saved on entry and
+   restored on exit; the swap chain follows through WM_SIZE and the guest
+   image is letterboxed to the new client area. Window thread only. */
+static void idd_set_fullscreen(VmDisplayIdd *d, BOOL on)
+{
+    HWND hwnd = d->hwnd;
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    HMENU sysmenu;
+
+    if (on == d->fullscreen) return;
+    if (on) {
+        d->windowed_placement.length = sizeof(d->windowed_placement);
+        if (!GetWindowPlacement(hwnd, &d->windowed_placement)) return;
+        d->windowed_placement.showCmd = IsZoomed(hwnd) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+        d->fullscreen = TRUE;  /* WM_GETMINMAXINFO lifts the native-size cap */
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (style & ~(LONG_PTR)WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        idd_fit_monitor(d);
+        d->bar_hover = -1;
+        d->bar_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, IDD_BAR_CLASS, NULL,
+                                      WS_POPUP, 0, 0, 0, 0, hwnd, NULL, d->hInstance, d);
+        if (d->bar_hwnd) {
+            idd_bar_layout(d);
+            SetTimer(hwnd, IDT_BAR, BAR_POLL_MS, NULL);
+        }
+    } else {
+        KillTimer(hwnd, IDT_BAR);
+        idd_bar_destroy(d);
+        d->fullscreen = FALSE;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (style & ~(LONG_PTR)WS_POPUP) | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(hwnd, &d->windowed_placement);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+    sysmenu = GetSystemMenu(hwnd, FALSE);
+    if (sysmenu)
+        CheckMenuItem(sysmenu, IDM_FULLSCREEN, MF_BYCOMMAND | (on ? MF_CHECKED : MF_UNCHECKED));
+    idd_log(d, on ? L"Fullscreen: ON." : L"Fullscreen: OFF.");
+}
+
+/* Ctrl+Alt+Del cannot be synthesized with SendInput; the guest agent raises
+   the Secure Attention Sequence itself (sas.dll!SendSAS from the service). */
+static void idd_send_cad(VmDisplayIdd *d)
+{
+    if (vm_agent_send(d->vm, "send_sas", NULL, 0, 3000)) {
+        idd_log(d, L"Sent Ctrl+Alt+Del to the guest.");
+    } else {
+        idd_log(d, L"Sending Ctrl+Alt+Del failed.");
+        ui_log(L"IDD: Could not send Ctrl+Alt+Del to \"%s\" (guest agent offline or out of date).",
+               d->vm_name);
+    }
+}
+
+/* Apply the saved viewer preferences to the (still hidden) window: restore
+   the remembered windowed placement, then enter fullscreen if that is the
+   default mode. */
+static void idd_apply_viewer_prefs(VmDisplayIdd *d)
+{
+    IddViewerPrefs p;
+    AcquireSRWLockShared(&g_viewer_prefs_lock);
+    idd_viewer_prefs_load(&p);
+    ReleaseSRWLockShared(&g_viewer_prefs_lock);
+    d->bar_pinned = p.bar_pinned;
+
+    if (p.settings.remember_placement && p.placement.right > p.placement.left &&
+        p.placement.bottom > p.placement.top &&
+        MonitorFromRect(&p.placement, MONITOR_DEFAULTTONULL)) {
+        WINDOWPLACEMENT wp = { sizeof(wp) };
+        wp.showCmd = SW_HIDE;
+        wp.rcNormalPosition = p.placement;
+        SetWindowPlacement(d->hwnd, &wp);
+    }
+    if (p.settings.window_mode == VIEWER_WINDOW_FULLSCREEN)
+        idd_set_fullscreen(d, TRUE);
 }
 
 /* Compute letterboxed/pillarboxed viewport within client rect */
@@ -2182,7 +2655,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     /* Compute outer window size so the client area is exactly 1920x1080 */
     {
-        DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
+        DWORD style   = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
         DWORD exstyle = 0;
         RECT wr = { 0, 0, 1920, 1080 };
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
@@ -2214,10 +2687,16 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
+            AppendMenuW(sysmenu, MF_STRING, IDM_FULLSCREEN, L"Fullscreen\tCtrl+Alt+Enter");
+            if (idd_is_windows_guest(d))
+                AppendMenuW(sysmenu, MF_STRING, IDM_SEND_CAD, L"Send Ctrl+Alt+Del\tCtrl+Alt+End");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
         }
     }
+
+    /* Restore the remembered placement / default window mode while still hidden */
+    idd_apply_viewer_prefs(d);
 
     /* Bring the display window to the foreground on open */
     ShowWindow(d->hwnd, SW_SHOW);
@@ -2336,6 +2815,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     switch (msg) {
     case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0) == IDM_FULLSCREEN) {
+            idd_set_fullscreen(d, !d->fullscreen);
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_SEND_CAD) {
+            idd_send_cad(d);
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
             wchar_t title[300];
@@ -2389,6 +2876,13 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CLOSE:
         if (d) {
             BOOL user_initiated = d->open;
+            WINDOWPLACEMENT placement = { sizeof(placement) };
+
+            if (d->fullscreen)
+                placement = d->windowed_placement;
+            else
+                GetWindowPlacement(hwnd, &placement);
+            idd_viewer_prefs_save_placement(&placement);
 
             RemoveClipboardFormatListener(hwnd);
 
@@ -2453,6 +2947,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
+        KillTimer(hwnd, IDT_BAR);
+        if (d) idd_bar_destroy(d);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) {
             d->stop = TRUE;
@@ -2474,7 +2970,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
         /* Max: native frame size */
-        if (d && d->frame_width > 0 && d->frame_height > 0) {
+        if (d && !d->fullscreen && d->frame_width > 0 && d->frame_height > 0) {
             wr.left = 0; wr.top = 0;
             wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
             AdjustWindowRectEx(&wr, style, FALSE, exstyle);
@@ -2488,6 +2984,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             RECT rc;
             GetClientRect(hwnd, &rc);
+            if (wp == SIZE_MINIMIZED) {
+                idd_flush_held_keys(d);
+                idd_bar_show(d, FALSE);
+            }
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             d3d_resize_swap_chain(d);
@@ -2497,6 +2997,21 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 ReleaseSRWLockExclusive(&g_mouse_capture_lock);
             }
             idd_update_relative_mouse(d);
+        }
+        return 0;
+
+    case WM_DISPLAYCHANGE:
+        if (d && d->fullscreen) idd_fit_monitor(d);
+        break;
+
+    case WM_IDD_HOTKEY:
+        if (d) {
+            /* Ctrl and Alt were already forwarded as held; release them in the guest. */
+            idd_flush_held_keys(d);
+            if (wp == VK_RETURN)
+                idd_set_fullscreen(d, !d->fullscreen);
+            else
+                idd_send_cad(d);
         }
         return 0;
 
@@ -2531,6 +3046,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->mouse_sync_pending) idd_poll_mouse_position(d);
             if (d->frame_dirty)
                 d3d_render_frame(d);
+        } else if (wp == IDT_BAR && d) {
+            idd_bar_tick(d);
         }
         return 0;
 
@@ -2584,6 +3101,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ENTERMENULOOP:
         if (d) {
             d->input_menu_active = TRUE;
+            d->hotkey_mods = 0;
             if (d->keyboard_version == INPUT_KEYBOARD_VERSION) idd_flush_held_keys(d);
             idd_flush_mouse_buttons(d);
             idd_update_relative_mouse(d);
@@ -2769,6 +3287,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL ext = (lp & (1 << 24)) != 0;
         BOOL up  = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
         if (!d) break;
+        if (idd_host_hotkey(d, (DWORD)wp, up)) return 0;
         if (!d->transmit_hotkeys &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */

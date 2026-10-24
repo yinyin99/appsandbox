@@ -42,7 +42,8 @@ typedef struct {
 typedef struct {
     wchar_t      guid[64];
     wchar_t      name[128];            /* editable friendly name */
-    wchar_t      snap_vhdx[MAX_PATH];  /* diff of base — frozen snapshot disk */
+    wchar_t      snap_vhdx[MAX_PATH];  /* frozen snapshot disk (never written again) */
+    wchar_t      parent_guid[64];      /* snapshot this one was taken from; "" = base disk */
     FILETIME     created;
     BOOL         valid;
     BranchEntry  branches[MAX_BRANCHES];
@@ -58,15 +59,21 @@ typedef struct {
     int          base_branch_count;
 } SnapshotTree;
 
+/* A snapshot (or base) other snapshots are built on cannot be deleted. */
+#define SNAPSHOT_E_HAS_DEPENDENTS  MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x5101)
+
 /* Initialize snapshot tree.  Loads tree.dat from base_dir if it exists. */
 void snapshot_init(SnapshotTree *tree, const wchar_t *base_dir);
 
 /* Persist snapshot tree metadata to tree.dat. */
 void snapshot_save(SnapshotTree *tree);
 
-/* Take a new snapshot: freeze current state as a named fork of the base.
-   VM must be stopped.  Auto-creates first branch and sets instance->vhdx_path.
-   base_vhdx is captured from instance->vhdx_path on the first call. */
+/* Take a new snapshot of the CURRENT disk.  VM must be stopped.
+   If the VM runs on a branch, that branch's disk is frozen in place as the new
+   snapshot (its content is kept, and it leaves the branch list); a new branch is
+   created on top of it and instance->vhdx_path is switched to it.  If the VM
+   runs on the base disk (first snapshot) base_vhdx is captured from
+   instance->vhdx_path and a snapshot + first branch are created off it. */
 HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *name);
 
 /* Create a new branch off a snapshot or base.
@@ -92,6 +99,9 @@ HRESULT snapshot_delete_branch(SnapshotTree *tree, VmInstance *instance, int ind
 /* Find which snapshot and branch match vhdx_path.
    Sets *snap_idx (-2=base, >=0=snapshot, -1=unknown) and *branch_idx (-1 if none). */
 ASB_API void snapshot_find_current(SnapshotTree *tree, const wchar_t *vhdx_path, int *snap_idx, int *branch_idx);
+
+/* Parent of snapshot s: -2 = base disk, >= 0 = another snapshot, -1 = unknown. */
+ASB_API int snapshot_parent_index(SnapshotTree *tree, int snap_idx);
 
 /* Get the last-write time of a branch file.  Returns FALSE if not found. */
 ASB_API BOOL snapshot_get_branch_time(SnapshotTree *tree, int snap_idx, int branch_idx, FILETIME *ft);

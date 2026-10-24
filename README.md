@@ -3,6 +3,15 @@
 
 # App Sandbox
 
+> **Personal fork.** This is a development fork of [jamesstringer90/appsandbox](https://github.com/jamesstringer90/appsandbox) for my own use. It adds features and fixes I need. It is not an official release; for the supported version use the upstream project.
+
+## Fork changes
+
+| Branch | What it adds |
+|---|---|
+| [`feat/viewer-fullscreen-cad`](https://github.com/yinyin99/appsandbox/tree/feat/viewer-fullscreen-cad) | Borderless fullscreen viewer (Ctrl+Alt+Enter) with an auto-hide/pinnable top bar (pin, minimize, exit fullscreen); General settings (open as window/fullscreen, remember size and position); Send Ctrl+Alt+Del from the title-bar menu or Ctrl+Alt+End (Windows guests; needs the updated guest agent). |
+| [`fix/snapshot-captures-current-disk`](https://github.com/yinyin99/appsandbox/tree/fix/snapshot-captures-current-disk) | Fixes "Take snapshot" silently reverting the VM to the original base disk; snapshots now capture the current disk, record their parent, and deletes that would orphan dependent disks are refused. |
+
 App Sandbox is a virtual machine app for Windows and macOS that's focused on performance and ease of use.
 
 Windows features:

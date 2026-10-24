@@ -38,6 +38,7 @@
 #include "hcs_vm.h"
 #include "ui.h"
 #include "resource.h"
+#include <dwmapi.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")

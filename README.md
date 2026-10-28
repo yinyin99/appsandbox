@@ -9,7 +9,7 @@
 
 | Feature | What it adds |
 |---|---|
-| Fullscreen viewer & Ctrl+Alt+Del | Borderless fullscreen viewer (Ctrl+Alt+Enter) with an auto-hide/pinnable top bar (pin, minimize, exit fullscreen); General settings (open as window/fullscreen, remember size and position); Send Ctrl+Alt+Del from the title-bar menu or Ctrl+Alt+End (Windows guests; needs the updated guest agent). |
+| Fullscreen viewer & Ctrl+Alt+Del | Borderless fullscreen viewer (Ctrl+Alt+Enter) with an auto-hide/pinnable top bar (pin, minimize, exit fullscreen, close window); General settings (open as window/fullscreen, remember size and position); Send Ctrl+Alt+Del from the title-bar menu or Ctrl+Alt+End (Windows guests; needs the updated guest agent). |
 | Snapshot fix | Fixes "Take snapshot" silently reverting the VM to the original base disk; snapshots now capture the current disk, record their parent, and deletes that would orphan dependent disks are refused. |
 
 All fork changes live on `main`.

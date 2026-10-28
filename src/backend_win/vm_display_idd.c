@@ -1071,7 +1071,7 @@ static void idd_update_kbd_hook(VmDisplayIdd *d)
  * keyboard focus in the viewer and its clicks never reach the guest.
  * ================================================================== */
 
-enum { BAR_BTN_PIN, BAR_BTN_MIN, BAR_BTN_EXIT, BAR_BTN_COUNT };
+enum { BAR_BTN_PIN, BAR_BTN_MIN, BAR_BTN_EXIT, BAR_BTN_CLOSE, BAR_BTN_COUNT };
 
 #define BAR_PX(d, px) MulDiv((px), (int)(d)->bar_dpi, 96)
 
@@ -1136,7 +1136,7 @@ static int idd_bar_hit(const VmDisplayIdd *d, int x)
 
 static void idd_bar_paint(VmDisplayIdd *d)
 {
-    static const wchar_t glyphs[BAR_BTN_COUNT] = { 0xE718, 0xE921, 0xE923 };  /* Pin, Minimize, BackToWindow */
+    static const wchar_t glyphs[BAR_BTN_COUNT] = { 0xE718, 0xE921, 0xE923, 0xE8BB };  /* Pin, Minimize, BackToWindow, ChromeClose */
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(d->bar_hwnd, &ps);
     HGDIOBJ brush = GetStockObject(DC_BRUSH);
@@ -1156,7 +1156,8 @@ static void idd_bar_paint(VmDisplayIdd *d)
     for (i = 0; i < BAR_BTN_COUNT; i++) {
         SetRect(&br, first + i * btn, 0, first + (i + 1) * btn, rc.bottom);
         if ((i == BAR_BTN_PIN && d->bar_pinned) || i == d->bar_hover) {
-            SetDCBrushColor(dc, i == BAR_BTN_PIN && d->bar_pinned ? RGB(0, 95, 184) : RGB(64, 64, 64));
+            SetDCBrushColor(dc, i == BAR_BTN_PIN && d->bar_pinned ? RGB(0, 95, 184) :
+                                i == BAR_BTN_CLOSE ? RGB(196, 43, 28) : RGB(64, 64, 64));
             FillRect(dc, &br, (HBRUSH)brush);
         }
         DrawTextW(dc, &glyphs[i], 1, &br, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
@@ -1210,6 +1211,10 @@ static LRESULT CALLBACK idd_bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case BAR_BTN_EXIT:
             /* Posted: leaving fullscreen destroys this window. */
             PostMessageW(d->hwnd, WM_SYSCOMMAND, IDM_FULLSCREEN, 0);
+            break;
+        case BAR_BTN_CLOSE:
+            /* Posted: closing destroys this window. Same path as the title-bar X. */
+            PostMessageW(d->hwnd, WM_CLOSE, 0, 0);
             break;
         }
         return 0;

@@ -186,6 +186,9 @@ typedef struct CursorHeader {
 
 /* ---- Display context ---- */
 
+/* Screen edge the fullscreen connection bar is docked to (see the bar section). */
+enum { BAR_EDGE_TOP, BAR_EDGE_BOTTOM, BAR_EDGE_LEFT, BAR_EDGE_RIGHT };
+
 struct VmDisplayIdd {
     VmInstance  *vm;
     wchar_t      vm_name[256];     /* copy of vm->name for safe logging after VM teardown */
@@ -260,9 +263,13 @@ struct VmDisplayIdd {
     BOOL             fullscreen;
     WINDOWPLACEMENT  windowed_placement; /* restored when leaving fullscreen */
 
-    /* Fullscreen connection bar (owned popup at the top centre of the monitor) */
+    /* Fullscreen connection bar (owned popup docked to a monitor edge) */
     HWND             bar_hwnd;
     BOOL             bar_pinned;     /* persisted in viewer_settings.json */
+    int              bar_edge;       /* BAR_EDGE_*, persisted */
+    int              bar_pos;        /* centre along the edge in permille, persisted */
+    int              bar_drag;       /* 0 none, 1 pressed on name/grip, 2 dragging */
+    POINT            bar_grab;       /* press point in bar client coords */
     int              bar_hover;      /* BAR_BTN_* under the cursor, -1 none */
     UINT             bar_dpi;        /* DPI the bar fonts/size were built for */
     int              bar_w, bar_h;
@@ -733,6 +740,8 @@ typedef struct {
     VmDisplayIddSettings settings;
     RECT                 placement;  /* WINDOWPLACEMENT.rcNormalPosition; empty = none saved */
     BOOL                 bar_pinned; /* fullscreen connection bar stays visible */
+    int                  bar_edge;   /* BAR_EDGE_* the bar is docked to */
+    int                  bar_pos;    /* bar centre along that edge, permille of its length */
 } IddViewerPrefs;
 
 static SRWLOCK g_viewer_prefs_lock = SRWLOCK_INIT;
@@ -765,6 +774,7 @@ static void idd_viewer_prefs_load(IddViewerPrefs *p)
     int v;
 
     ZeroMemory(p, sizeof(*p));
+    p->bar_pos = 500;  /* top-centre unless the file says otherwise */
     idd_viewer_prefs_dir(dir, MAX_PATH);
     swprintf_s(path, MAX_PATH, L"%s\\viewer_settings.json", dir);
     if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
@@ -778,6 +788,8 @@ static void idd_viewer_prefs_load(IddViewerPrefs *p)
         if (idd_json_int(buf, "right", &v))  p->placement.right = v;
         if (idd_json_int(buf, "bottom", &v)) p->placement.bottom = v;
         if (idd_json_int(buf, "barPinned", &v)) p->bar_pinned = v != 0;
+        if (idd_json_int(buf, "barEdge", &v) && v >= BAR_EDGE_TOP && v <= BAR_EDGE_RIGHT) p->bar_edge = v;
+        if (idd_json_int(buf, "barPos", &v) && v >= 0 && v <= 1000) p->bar_pos = v;
     }
     fclose(f);
 }
@@ -792,19 +804,22 @@ static void idd_viewer_prefs_save(const IddViewerPrefs *p)
     swprintf_s(path, MAX_PATH, L"%s\\viewer_settings.json", dir);
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     fprintf(f, "{\"windowMode\":%d,\"rememberPlacement\":%d,\"barPinned\":%d,"
+               "\"barEdge\":%d,\"barPos\":%d,"
                "\"left\":%ld,\"top\":%ld,\"right\":%ld,\"bottom\":%ld}\n",
             p->settings.window_mode, p->settings.remember_placement ? 1 : 0,
-            p->bar_pinned ? 1 : 0,
+            p->bar_pinned ? 1 : 0, p->bar_edge, p->bar_pos,
             p->placement.left, p->placement.top, p->placement.right, p->placement.bottom);
     fclose(f);
 }
 
-static void idd_viewer_prefs_save_pinned(BOOL pinned)
+static void idd_viewer_prefs_save_bar(const VmDisplayIdd *d)
 {
     IddViewerPrefs p;
     AcquireSRWLockExclusive(&g_viewer_prefs_lock);
     idd_viewer_prefs_load(&p);
-    p.bar_pinned = pinned;
+    p.bar_pinned = d->bar_pinned;
+    p.bar_edge = d->bar_edge;
+    p.bar_pos = d->bar_pos;
     idd_viewer_prefs_save(&p);
     ReleaseSRWLockExclusive(&g_viewer_prefs_lock);
 }
@@ -1069,13 +1084,23 @@ static void idd_update_kbd_hook(VmDisplayIdd *d)
  * A separate owned popup rather than a child of render_hwnd so it
  * composes over the flip-model swap chain; WS_EX_NOACTIVATE keeps
  * keyboard focus in the viewer and its clicks never reach the guest.
+ *
+ * Movable: dragging the name/grip area (past the system drag threshold,
+ * with mouse capture) moves the bar with the cursor; on release it docks
+ * to the monitor edge nearest the cursor. Top/bottom lay out horizontally
+ * (name + buttons); left/right stack the buttons under a small grip with
+ * the name hidden. Edge and position along it (permille of the edge, so it
+ * survives resolution/DPI changes) persist in viewer_settings.json; the
+ * auto-hide hot zone is the strip along the docked edge.
  * ================================================================== */
 
 enum { BAR_BTN_PIN, BAR_BTN_MIN, BAR_BTN_EXIT, BAR_BTN_CLOSE, BAR_BTN_COUNT };
 
 #define BAR_PX(d, px) MulDiv((px), (int)(d)->bar_dpi, 96)
+#define BAR_VERT(d)   ((d)->bar_edge >= BAR_EDGE_LEFT)
 
-/* Size the bar for the current DPI and centre it on the viewer's monitor. */
+/* Size the bar for its orientation and DPI and place it on the viewer's
+   monitor: flush against bar_edge, centred at bar_pos (permille of the edge). */
 static void idd_bar_layout(VmDisplayIdd *d)
 {
     MONITORINFO mi = { sizeof(mi) };
@@ -1083,7 +1108,8 @@ static void idd_bar_layout(VmDisplayIdd *d)
     SIZE sz = { 0, 0 };
     HDC dc;
     HGDIOBJ old;
-    int name_w;
+    RECT *m = &mi.rcMonitor;
+    int name_w, len, org, span, a;
 
     if (!GetMonitorInfoW(MonitorFromWindow(d->hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
     if (dpi != d->bar_dpi) {
@@ -1103,10 +1129,21 @@ static void idd_bar_layout(VmDisplayIdd *d)
     SelectObject(dc, old);
     ReleaseDC(d->bar_hwnd, dc);
     name_w = sz.cx < BAR_PX(d, 240) ? sz.cx : BAR_PX(d, 240);
-    d->bar_w = BAR_PX(d, 24) + name_w + BAR_BTN_COUNT * BAR_PX(d, 40);
-    d->bar_h = BAR_PX(d, 30);
-    SetWindowPos(d->bar_hwnd, NULL, (mi.rcMonitor.left + mi.rcMonitor.right - d->bar_w) / 2,
-                 mi.rcMonitor.top, d->bar_w, d->bar_h, SWP_NOACTIVATE | SWP_NOZORDER);
+    if (BAR_VERT(d)) {
+        d->bar_w = BAR_PX(d, 40);
+        d->bar_h = BAR_PX(d, 24) + BAR_BTN_COUNT * BAR_PX(d, 40);
+    } else {
+        d->bar_w = BAR_PX(d, 24) + name_w + BAR_BTN_COUNT * BAR_PX(d, 40);
+        d->bar_h = BAR_PX(d, 30);
+    }
+    len  = BAR_VERT(d) ? d->bar_h : d->bar_w;
+    org  = BAR_VERT(d) ? m->top : m->left;
+    span = BAR_VERT(d) ? m->bottom - m->top : m->right - m->left;
+    a = max(org, min(org + span - len, org + MulDiv(span, d->bar_pos, 1000) - len / 2));
+    SetWindowPos(d->bar_hwnd, NULL,
+                 BAR_VERT(d) ? (d->bar_edge == BAR_EDGE_LEFT ? m->left : m->right - d->bar_w) : a,
+                 BAR_VERT(d) ? a : (d->bar_edge == BAR_EDGE_TOP ? m->top : m->bottom - d->bar_h),
+                 d->bar_w, d->bar_h, SWP_NOACTIVATE | SWP_NOZORDER);
     InvalidateRect(d->bar_hwnd, NULL, FALSE);
 }
 
@@ -1127,11 +1164,12 @@ static void idd_bar_destroy(VmDisplayIdd *d)
     d->bar_dpi = 0;
 }
 
-/* Button under client x, or -1 over the name. */
-static int idd_bar_hit(const VmDisplayIdd *d, int x)
+/* Button under client point (x, y), or -1 over the name/grip. */
+static int idd_bar_hit(const VmDisplayIdd *d, int x, int y)
 {
-    int first = d->bar_w - BAR_BTN_COUNT * BAR_PX(d, 40);
-    return x < first || x >= d->bar_w ? -1 : (x - first) / BAR_PX(d, 40);
+    int c = BAR_VERT(d) ? y : x, len = BAR_VERT(d) ? d->bar_h : d->bar_w;
+    int first = len - BAR_BTN_COUNT * BAR_PX(d, 40);
+    return c < first || c >= len ? -1 : (c - first) / BAR_PX(d, 40);
 }
 
 static void idd_bar_paint(VmDisplayIdd *d)
@@ -1140,7 +1178,8 @@ static void idd_bar_paint(VmDisplayIdd *d)
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(d->bar_hwnd, &ps);
     HGDIOBJ brush = GetStockObject(DC_BRUSH);
-    int btn = BAR_PX(d, 40), first = d->bar_w - BAR_BTN_COUNT * btn;
+    BOOL v = BAR_VERT(d);
+    int btn = BAR_PX(d, 40), first = (v ? d->bar_h : d->bar_w) - BAR_BTN_COUNT * btn;
     RECT rc, br;
     int i;
 
@@ -1149,12 +1188,22 @@ static void idd_bar_paint(VmDisplayIdd *d)
     FillRect(dc, &rc, (HBRUSH)brush);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(230, 230, 230));
-    SelectObject(dc, d->bar_font);
-    SetRect(&br, BAR_PX(d, 12), 0, first, rc.bottom);
-    DrawTextW(dc, d->vm_name, -1, &br, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    if (v) {  /* name hidden; three short bars as the grip */
+        SetDCBrushColor(dc, RGB(150, 150, 150));
+        for (i = 0; i < 3; i++) {
+            SetRect(&br, rc.right / 2 - BAR_PX(d, 8), first / 2 - BAR_PX(d, 4) + i * BAR_PX(d, 4),
+                    rc.right / 2 + BAR_PX(d, 8), first / 2 - BAR_PX(d, 4) + i * BAR_PX(d, 4) + BAR_PX(d, 1));
+            FillRect(dc, &br, (HBRUSH)brush);
+        }
+    } else {
+        SelectObject(dc, d->bar_font);
+        SetRect(&br, BAR_PX(d, 12), 0, first, rc.bottom);
+        DrawTextW(dc, d->vm_name, -1, &br, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
     SelectObject(dc, d->bar_icon_font);
     for (i = 0; i < BAR_BTN_COUNT; i++) {
-        SetRect(&br, first + i * btn, 0, first + (i + 1) * btn, rc.bottom);
+        if (v) SetRect(&br, 0, first + i * btn, rc.right, first + (i + 1) * btn);
+        else   SetRect(&br, first + i * btn, 0, first + (i + 1) * btn, rc.bottom);
         if ((i == BAR_BTN_PIN && d->bar_pinned) || i == d->bar_hover) {
             SetDCBrushColor(dc, i == BAR_BTN_PIN && d->bar_pinned ? RGB(0, 95, 184) :
                                 i == BAR_BTN_CLOSE ? RGB(196, 43, 28) : RGB(64, 64, 64));
@@ -1163,6 +1212,42 @@ static void idd_bar_paint(VmDisplayIdd *d)
         DrawTextW(dc, &glyphs[i], 1, &br, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
     }
     EndPaint(d->bar_hwnd, &ps);
+}
+
+/* Dock to the monitor edge nearest the cursor, keeping where along that edge
+   the bar was dropped, and persist it. */
+static void idd_bar_snap(VmDisplayIdd *d)
+{
+    MONITORINFO mi = { sizeof(mi) };
+    POINT pt;
+    RECT br;
+    int dist[4], i, edge = BAR_EDGE_TOP, c, org, span;
+    BOOL was_v = BAR_VERT(d);
+
+    if (!GetMonitorInfoW(MonitorFromWindow(d->hwnd, MONITOR_DEFAULTTONEAREST), &mi) ||
+        !GetCursorPos(&pt) || !GetWindowRect(d->bar_hwnd, &br))
+        return;
+    dist[BAR_EDGE_TOP]    = pt.y - mi.rcMonitor.top;
+    dist[BAR_EDGE_BOTTOM] = mi.rcMonitor.bottom - pt.y;
+    dist[BAR_EDGE_LEFT]   = pt.x - mi.rcMonitor.left;
+    dist[BAR_EDGE_RIGHT]  = mi.rcMonitor.right - pt.x;
+    for (i = 1; i < 4; i++)
+        if (dist[i] < dist[edge]) edge = i;
+    d->bar_edge = edge;
+    /* Same orientation: keep the dragged bar's centre; otherwise follow the cursor. */
+    if (BAR_VERT(d)) {
+        c = was_v ? (br.top + br.bottom) / 2 : pt.y;
+        org = mi.rcMonitor.top;
+        span = mi.rcMonitor.bottom - org;
+    } else {
+        c = was_v ? pt.x : (br.left + br.right) / 2;
+        org = mi.rcMonitor.left;
+        span = mi.rcMonitor.right - org;
+    }
+    d->bar_pos = max(0, min(1000, MulDiv(c - org, 1000, span)));
+    d->bar_leave_tick = GetTickCount64();
+    idd_bar_layout(d);
+    idd_viewer_prefs_save_bar(d);
 }
 
 static LRESULT CALLBACK idd_bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -1184,9 +1269,32 @@ static LRESULT CALLBACK idd_bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_PAINT:
         idd_bar_paint(d);
         return 0;
+    case WM_LBUTTONDOWN:
+        if (idd_bar_hit(d, (short)LOWORD(lp), (short)HIWORD(lp)) < 0) {
+            d->bar_grab.x = (short)LOWORD(lp);
+            d->bar_grab.y = (short)HIWORD(lp);
+            d->bar_drag = 1;
+            SetCapture(hwnd);
+        }
+        return 0;
     case WM_MOUSEMOVE: {
         TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
-        int hit = idd_bar_hit(d, (short)LOWORD(lp));
+        int hit;
+        if (d->bar_drag) {
+            POINT pt;
+            RECT br;
+            GetCursorPos(&pt);
+            GetWindowRect(hwnd, &br);
+            /* A press that has not left the drag rectangle is still a click. */
+            if (d->bar_drag == 1 && abs(pt.x - br.left - d->bar_grab.x) < GetSystemMetrics(SM_CXDRAG) &&
+                abs(pt.y - br.top - d->bar_grab.y) < GetSystemMetrics(SM_CYDRAG))
+                return 0;
+            d->bar_drag = 2;
+            SetWindowPos(hwnd, NULL, pt.x - d->bar_grab.x, pt.y - d->bar_grab.y, 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+            return 0;
+        }
+        hit = idd_bar_hit(d, (short)LOWORD(lp), (short)HIWORD(lp));
         TrackMouseEvent(&tme);
         if (hit != d->bar_hover) {
             d->bar_hover = hit;
@@ -1198,11 +1306,22 @@ static LRESULT CALLBACK idd_bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         d->bar_hover = -1;
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
+    case WM_CAPTURECHANGED:  /* drop, or capture stolen: snap either way */
+        if (d->bar_drag == 2) {
+            d->bar_drag = 0;
+            idd_bar_snap(d);
+        }
+        d->bar_drag = 0;
+        return 0;
     case WM_LBUTTONUP:
-        switch (idd_bar_hit(d, (short)LOWORD(lp))) {
+        if (d->bar_drag) {
+            ReleaseCapture();
+            return 0;
+        }
+        switch (idd_bar_hit(d, (short)LOWORD(lp), (short)HIWORD(lp))) {
         case BAR_BTN_PIN:
             d->bar_pinned = !d->bar_pinned;
-            idd_viewer_prefs_save_pinned(d->bar_pinned);
+            idd_viewer_prefs_save_bar(d);
             InvalidateRect(hwnd, NULL, FALSE);
             break;
         case BAR_BTN_MIN:
@@ -1222,16 +1341,18 @@ static LRESULT CALLBACK idd_bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-/* Show the bar when pinned, or while the cursor is on it / in the top-edge
-   hot zone above it; hide BAR_HIDE_MS after the cursor leaves. The hot zone
-   is inert while the guest owns the mouse (relative capture), a button is
-   held, or the viewer is not the active window. */
+/* Show the bar when pinned or being dragged, or while the cursor is on it /
+   in the hot zone (a few px strip along the docked screen edge, spanning the
+   bar); hide BAR_HIDE_MS after the cursor leaves. The hot zone is inert while
+   the guest owns the mouse (relative capture), a button is held, or the
+   viewer is not the active window. */
 static void idd_bar_tick(VmDisplayIdd *d)
 {
     POINT pt;
     RECT br;
     ULONGLONG now = GetTickCount64();
-    BOOL show = d->bar_pinned;
+    BOOL show = d->bar_pinned || d->bar_drag;
+    int z = BAR_PX(d, 3);
 
     if (!d->bar_hwnd) return;
     if (!IsWindowVisible(d->hwnd) || IsIconic(d->hwnd) || !GetCursorPos(&pt)) {
@@ -1242,7 +1363,10 @@ static void idd_bar_tick(VmDisplayIdd *d)
         BOOL visible = IsWindowVisible(d->bar_hwnd);
         BOOL hot, usable;
         GetWindowRect(d->bar_hwnd, &br);
-        hot = pt.x >= br.left && pt.x < br.right && pt.y >= br.top && pt.y < br.top + BAR_PX(d, 3);
+        hot = PtInRect(&br, pt) &&
+              (d->bar_edge == BAR_EDGE_TOP    ? pt.y < br.top + z :
+               d->bar_edge == BAR_EDGE_BOTTOM ? pt.y >= br.bottom - z :
+               d->bar_edge == BAR_EDGE_LEFT   ? pt.x < br.left + z : pt.x >= br.right - z);
         usable = !d->relative_mouse && !d->input_menu_active && !d->mouse_buttons &&
                  d->input_focused && GetForegroundWindow() == d->hwnd;
         if ((hot && usable) || (visible && PtInRect(&br, pt))) {
@@ -1331,6 +1455,8 @@ static void idd_apply_viewer_prefs(VmDisplayIdd *d)
     idd_viewer_prefs_load(&p);
     ReleaseSRWLockShared(&g_viewer_prefs_lock);
     d->bar_pinned = p.bar_pinned;
+    d->bar_edge = p.bar_edge;
+    d->bar_pos = p.bar_pos;
 
     if (p.settings.remember_placement && p.placement.right > p.placement.left &&
         p.placement.bottom > p.placement.top &&

@@ -4103,6 +4103,31 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     return S_OK;
 }
 
+ASB_API HRESULT asb_vm_set_disk(AsbVm vm, DWORD hdd_gb)
+{
+    HRESULT hr;
+    int idx = vm_index_of(vm);
+    if (idx < 0 || hdd_gb == 0) return E_INVALIDARG;
+    /* Template disks are parents of instance disks; resizing would break them. */
+    if (g_vms[idx].running || g_vms[idx].building_vhdx || g_vms[idx].is_template) return E_ACCESSDENIED;
+    /* Only resize a leaf: fork a branch if the selected disk is a frozen base/snapshot. */
+    hr = snapshot_ensure_writable(&g_snap_trees[idx], &g_vms[idx]);
+    if (FAILED(hr)) { asb_log(L"Error: Failed to create working branch (0x%08X)", hr); return hr; }
+    /* A cached HCS system still points at the old disk path; drop it like asb_vm_start does. */
+    if (hr == S_OK && g_vms[idx].handle) hcs_close_vm(&g_vms[idx]);
+    /* shortcut: synchronous resize; fixed-size VHDX would block the UI while zero-filling — move to a worker if fixed disks appear */
+    hr = vhdx_grow(g_vms[idx].vhdx_path, (ULONGLONG)hdd_gb);
+    if (FAILED(hr)) {
+        asb_log(L"Error: Failed to grow disk of \"%s\" to %lu GB (0x%08X).", g_vms[idx].name, hdd_gb, hr);
+    } else {
+        g_vms[idx].hdd_gb = hdd_gb;
+        asb_log(L"Disk of \"%s\" grown to %lu GB. Extend the partition inside the guest to use it.", g_vms[idx].name, hdd_gb);
+    }
+    save_vm_list();   /* also persists a vhdx_path changed by ensure_writable */
+    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    return hr;
+}
+
 /* ---- Snapshots ---- */
 
 ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)

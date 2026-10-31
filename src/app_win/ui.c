@@ -1249,6 +1249,10 @@ static void on_webview2_message(const wchar_t *json)
                     if (!error) hr = asb_vm_set_gpu_selection(vm, mode, gpu_id);
                 }
                 else if (wcscmp(field, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(value));
+                else if (wcscmp(field, L"hddGb") == 0) {
+                    hr = asb_vm_set_disk(vm, (DWORD)_wtoi(value));
+                    if (FAILED(hr)) error = L"The virtual disk could not be grown. Disk size can only be increased, templates cannot be resized; see the log for details.";
+                }
                 if (FAILED(hr)) ui_show_alert(error ? error : L"VM configuration could not be updated.");
                 else asb_save();
             }

@@ -1208,6 +1208,11 @@ function openEditVmModal(idx) {
     document.getElementById('edit-ram-size').value = vm.ramMb;
     document.getElementById('edit-ram-size').min = hostBridge.isMac ? 512 : 4000;
     document.getElementById('edit-cpu-cores').value = vm.cpuCores;
+    document.getElementById('edit-hdd-size').value = vm.hddGb;
+    document.getElementById('edit-hdd-size').min = vm.hddGb;
+    document.getElementById('edit-hdd-hint').textContent = vm.osType === 'Windows'
+        ? 'Grow only. Then in Windows: Disk Management → right-click C: → Extend Volume.'
+        : 'Grow only. Then extend the root partition inside the guest.';
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
     updateEditVmModal();
@@ -1240,6 +1245,7 @@ function editVmValues() {
     if (!hostBridge.isMac) {
         Object.assign(values, selectedGpu('edit-gpu-mode'));
         values.networkMode = Number(document.getElementById('edit-net-mode').value);
+        values.hddGb = document.getElementById('edit-hdd-size').valueAsNumber;
     }
     return values;
 }
@@ -1251,6 +1257,11 @@ function editVmValidationError(values) {
     if (values.ramMb !== editVmState.initial.ramMb &&
         (!Number.isInteger(values.ramMb) || values.ramMb < minRam || values.ramMb > 2147483647))
         return 'RAM must be a whole number of at least ' + minRam + ' MB.';
+    if (values.hddGb !== undefined && values.hddGb !== editVmState.initial.hddGb) {
+        if (editVmState.initial.isTemplate) return 'Template disks cannot be resized.';
+        if (!Number.isInteger(values.hddGb) || values.hddGb < editVmState.initial.hddGb || values.hddGb > 65536)
+            return 'Disk size can only be increased (currently ' + editVmState.initial.hddGb + ' GB, max 65536 GB).';
+    }
     return '';
 }
 

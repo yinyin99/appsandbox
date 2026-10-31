@@ -9,7 +9,8 @@
 
 | Feature | What it adds |
 |---|---|
-| Fullscreen viewer & Ctrl+Alt+Del | Borderless fullscreen viewer (Ctrl+Alt+Enter) with an auto-hide/pinnable bar (pin, minimize, exit fullscreen, close window) that can be dragged and docked to any screen edge (position remembered); General settings (open as window/fullscreen, remember size and position); Send Ctrl+Alt+Del from the title-bar menu or Ctrl+Alt+End (Windows guests; needs the updated guest agent). |
+| Fullscreen viewer | Borderless fullscreen viewer (Ctrl+Alt+Enter) with an auto-hide/pinnable bar (pin, minimize, exit fullscreen, close window) that can be dragged and docked to any screen edge (position remembered); General settings (open as window/fullscreen, remember size and position). |
+| Ctrl+Alt+Del | Send Ctrl+Alt+Del from the title-bar menu or Ctrl+Alt+End (Windows guests; needs the updated guest agent). |
 | Snapshot fix | Fixes "Take snapshot" silently reverting the VM to the original base disk; snapshots now capture the current disk, record their parent, and deletes that would orphan dependent disks are refused. |
 | Grow VM disk | Edit dialog has an HDD Size field (Windows host, VM stopped) that grows the VM's virtual disk; grow-only, templates excluded, and a VM on a snapshot gets a fresh branch so frozen disks stay untouched. Extend the partition inside the guest afterwards (Windows: Disk Management → right-click C: → Extend Volume). |
 

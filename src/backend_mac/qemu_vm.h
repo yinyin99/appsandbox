@@ -45,6 +45,7 @@ typedef void (^QemuVmLog)(NSString *line);
 
 @property (nonatomic, copy, readonly)   NSString *name;
 @property (nonatomic, assign, readonly) QemuVmState state;
+@property (nonatomic, assign, readonly) BOOL exitedCleanly;
 
 /* The shared-memory transport, available once the VM is Running. The core hands this to
  * VmAgentMac / VmSshProxyMac / VmClipboardMac (the ivshmem path). nil before start / after stop. */

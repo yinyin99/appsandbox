@@ -3,11 +3,15 @@
 #include <stdio.h>
 #include "ui.h"
 #include "headless.h"
+#include "../backend_win/gpu_broker.h"
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow)
 {
     HWND hwnd;
     MSG msg;
+    int broker_result;
+
+    if (asb_gpu_broker_dispatch(&broker_result)) return broker_result;
 
     (void)hPrevInstance;
     (void)pCmdLine;
@@ -20,7 +24,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     /* Headless daemon mode: appsandbox.exe --headless
        (normal launches pass no args, so the GUI path below is unaffected). */
-    if (pCmdLine && wcsstr(pCmdLine, L"--headless")) {
+    if (pCmdLine && wcsstr(pCmdLine, L"-headless")) {
         int rc = run_headless(hInstance, pCmdLine);
         OleUninitialize();
         return rc;

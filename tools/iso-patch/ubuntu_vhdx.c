@@ -1344,7 +1344,8 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "if DEBIAN_FRONTEND=noninteractive apt-get install -y $APT_OPTS \\\n"
         "       build-essential dkms \"linux-headers-$TGT_KVER\" \\\n"
         "       libasound2-dev libxcb1-dev libxcb-xfixes0-dev libdrm-dev libsystemd-dev \\\n"
-        "       pkg-config 2>&1 | tail -20; then\n"
+        "       pkg-config directx-headers-dev"
+        " 2>&1 | tail -20; then\n"
         "    echo \"OK: apt install all build tools\"\n"
         "else\n"
         "    rc=$?\n"
@@ -1424,6 +1425,9 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "          && echo \"OK: install $unit\" || echo \"FAIL: install $unit\"\n"
         "    fi\n"
         "done\n"
+        "install -d /etc/systemd/system/appsandbox-agent.service.d\n"
+        "printf '%s\\n' '[Unit]' 'After=NetworkManager.service systemd-networkd.service' \\\n"
+        "    > /etc/systemd/system/appsandbox-agent.service.d/10-network-renderer.conf\n"
         "# Clipboard is a user-level unit (graphical-session.target).\n"
         "if [ -f \"$EXTRAS/systemd/appsandbox-clipboard.service\" ]; then\n"
         "    install -d /etc/systemd/user\n"
@@ -1698,6 +1702,12 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "\n"
         "# --- STEP 99: Mark done + reboot ---\n"
         "echo \"==== STEP 99: mark done + reboot ====\"\n"
+        "for b in appsandbox-agent appsandbox-audio appsandbox-clipboard appsandbox-display appsandbox-input; do\n"
+        "    [ -x /usr/local/bin/$b ] || { echo \"FAIL: required binary $b is missing\"; exit 1; }\n"
+        "done\n"
+        "for mod in asb_drm dxgkrnl; do\n"
+        "    modinfo -k \"$TGT_KVER\" \"$mod\" >/dev/null 2>&1 || { echo \"FAIL: required module $mod is missing\"; exit 1; }\n"
+        "done\n"
         "mkdir -p /var/lib || true\n"
         "touch /var/lib/appsandbox-firstboot.done\n"
         "systemctl disable appsandbox-firstboot.service 2>&1 || true\n"
@@ -2023,8 +2033,13 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
     {
         sqfs_ctx_t *peek = sqfs_open(sqfs_path);
         if (peek) {
-            est_inodes = sqfs_sb(peek)->inode_count + 4096;
+            uint64_t count = (uint64_t)sqfs_sb(peek)->inode_count * 2 + 4096;
             sqfs_close(peek);
+            if (count > UINT32_MAX) {
+                log_err(L"Ubuntu image requires too many filesystem inodes");
+                goto cleanup;
+            }
+            est_inodes = (uint32_t)count;
         }
     }
 

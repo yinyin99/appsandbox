@@ -1581,11 +1581,17 @@ static BOOL run_devcon(const wchar_t *args, char *output, int output_size, DWORD
     }
     CloseHandle(hWrite);
 
-    /* Wait for devcon to finish (10s max). If it hangs, kill it. */
-    if (WaitForSingleObject(pi.hProcess, 2000) == WAIT_TIMEOUT) {
+    /* Wait for devcon to finish (10s max). If it hangs, kill it and report failure so the
+       caller never acts on a partial result (a killed status check used to trigger a restart). */
+    if (WaitForSingleObject(pi.hProcess, 10000) == WAIT_TIMEOUT) {
         agent_log("run_devcon: process timed out, killing.");
         TerminateProcess(pi.hProcess, 1);
         WaitForSingleObject(pi.hProcess, 3000);
+        CloseHandle(hRead);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        output[0] = '\0';
+        return FALSE;
     }
 
     /* Now read whatever output is available (process is dead, pipe will EOF) */
@@ -1608,7 +1614,7 @@ static void ensure_vdd_running(void)
     DWORD exit_code = 0;
 
     if (!run_devcon(L"status Root\\AppSandboxVDD", output, sizeof(output), &exit_code)) {
-        agent_log("ensure_vdd_running: devcon failed to launch (%lu).", GetLastError());
+        agent_log("ensure_vdd_running: devcon status did not complete; skipping this check.");
         return;
     }
 
@@ -1625,7 +1631,7 @@ static void ensure_vdd_running(void)
     if (strstr(output, "disabled")) {
         agent_log("VDD: disabled - enabling.");
         if (!run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code)) {
-            agent_log("VDD enable: devcon failed to launch (%lu).", GetLastError());
+            agent_log("VDD enable: devcon did not complete.");
             return;
         }
         agent_log("VDD enable (exit=%lu): %.400s", exit_code, output);
@@ -1638,7 +1644,7 @@ static void ensure_vdd_running(void)
         agent_log("VDD: unknown state - restarting.");
 
     if (!run_devcon(L"restart Root\\AppSandboxVDD", output, sizeof(output), &exit_code)) {
-        agent_log("VDD restart: devcon failed to launch (%lu).", GetLastError());
+        agent_log("VDD restart: devcon did not complete.");
         return;
     }
     agent_log("VDD restart (exit=%lu): %.400s", exit_code, output);

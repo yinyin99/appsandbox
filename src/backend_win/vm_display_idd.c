@@ -3423,8 +3423,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         vm = asb_find_vm_by_id(d->vm_id);
         EnterCriticalSection(&d->frame_cs);
+        /* Fork: also rebuild after an earlier shared-GPU failure, else GPU sharing (and
+           Match window size) stays off for the window's lifetime after a guest driver restart. */
         if (!d->stop && d->shared_thread && vm && vm->running &&
-            wcscmp(d->gpu_id, vm->gpu_id) != 0) {
+            (wcscmp(d->gpu_id, vm->gpu_id) != 0 || d->shared_disabled)) {
             wcscpy_s(d->gpu_id, ARRAYSIZE(d->gpu_id), vm->gpu_id);
             InterlockedExchange(&d->gpu_refresh_requested, 1);
             SetEvent(d->shared_wake);

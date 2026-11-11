@@ -2964,7 +2964,15 @@ static void d3d_render_frame(VmDisplayIdd *d)
     }
     if (!d->rtv) {
         GetClientRect(d->render_hwnd, &rc);
-        if (rc.right > 0 && rc.bottom > 0) d3d_recover(d);
+        if (rc.right > 0 && rc.bottom > 0) {
+            /* Fork: on restore from minimize this thread can render before it handles the
+               resize request. Rebuild the render target; a full recover would tear down GPU
+               sharing and make the guest switch display modes twice (seconds of black). */
+            EnterCriticalSection(&d->frame_cs);
+            d3d_resize_swap_chain(d);
+            LeaveCriticalSection(&d->frame_cs);
+            if (!d->rtv) d3d_recover(d);
+        }
         return;
     }
 

@@ -13,6 +13,7 @@
 | Ctrl+Alt+Del | Send Ctrl+Alt+Del from the title-bar menu or Ctrl+Alt+End (Windows guests; needs the updated guest agent). |
 | Snapshot fix | Fixes "Take snapshot" silently reverting the VM to the original base disk; snapshots now capture the current disk, record their parent, and deletes that would orphan dependent disks are refused. |
 | Grow VM disk | Edit dialog has an HDD Size field (Windows host, VM stopped) that grows the VM's virtual disk; grow-only, templates excluded, and a VM on a snapshot gets a fresh branch so frozen disks stay untouched. Extend the partition inside the guest afterwards (Windows: Disk Management → right-click C: → Extend Volume). |
+| Files on paste | Files copied on the PC reach a Windows guest only when you paste them there, so a big copy on the PC can't freeze the viewer or fill the VM's disk. Up to 1 GB pastes in place; larger pastes ask first (with a free-space check) and copy into `Downloads\From PC` (needs the updated guest clipboard helper). |
 
 All fork changes live on `main`.
 

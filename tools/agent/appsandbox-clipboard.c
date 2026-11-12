@@ -141,6 +141,7 @@ static HANDLE        g_xfer_event = NULL;     /* set when a SYNC transfer ends *
 static HANDLE        g_size_event = NULL;
 static ClipSizeResp  g_size;
 static volatile LONG g_large_pending = 0;     /* the large-paste dialog is open or queued */
+static volatile LONG g_large_asked = 0;       /* answered for this PC clipboard: don't ask again */
 static wchar_t       g_xfer_dest[MAX_PATH];
 
 /* Message window (created on msg_window_thread) */
@@ -434,16 +435,23 @@ static BOOL clip_query_size(UINT64 limit, ClipSizeResp *out, DWORD timeout_ms)
     return TRUE;
 }
 
-/* %USERPROFILE%\Downloads\From PC of the logged-in user.
+/* %USERPROFILE%\Downloads\From PC of the logged-in user. The agent normally runs this
+   helper as that user; WTSQueryUserToken only covers a SYSTEM launch.
    shortcut: ignores a relocated Downloads folder; use SHGetKnownFolderPath if someone moves it. */
 static BOOL clip_downloads_dir(wchar_t *out)
 {
+    static const wchar_t path[] = L"%USERPROFILE%\\Downloads\\From PC";
     DWORD session_id = WTSGetActiveConsoleSessionId();
     HANDLE token = NULL;
-    BOOL ok;
-    if (session_id == 0xFFFFFFFF || !WTSQueryUserToken(session_id, &token)) return FALSE;
-    ok = ExpandEnvironmentStringsForUserW(token, L"%USERPROFILE%\\Downloads\\From PC", out, MAX_PATH);
-    CloseHandle(token);
+    BOOL ok = FALSE;
+    if (session_id != 0xFFFFFFFF && WTSQueryUserToken(session_id, &token)) {
+        ok = ExpandEnvironmentStringsForUserW(token, path, out, MAX_PATH);
+        CloseHandle(token);
+    }
+    if (!ok) {
+        DWORD n = ExpandEnvironmentStringsW(path, out, MAX_PATH);
+        ok = n > 0 && n <= MAX_PATH && out[0] != L'%';
+    }
     if (ok) CreateDirectoryW(out, NULL);
     return ok;
 }
@@ -518,6 +526,8 @@ static void clip_render_hdrop(void)
         clip_log("Paste ignored: a copy from the PC is already running.");
         return;
     }
+    /* Explorer and others read CF_HDROP again; one dialog per copy on the PC. */
+    if (g_large_asked) return;
     /* No answer = old host; it then refuses over 1 GB itself. */
     clip_query_size(CLIP_PASTE_LIMIT, &size, CLIP_SIZE_QUICK_MS);
     if (size.over) {
@@ -562,13 +572,15 @@ static void clip_large_paste(void)
     ULARGE_INTEGER free_bytes;
     wchar_t dest[MAX_PATH], gb[32], free_gb[32], msg[1024];
 
+    InterlockedExchange(&g_large_asked, 1);
     if (!clip_query_size(0, &size, 120000) || !size.bytes) {
         MessageBoxW(NULL, L"Couldn't read the size of the files on the PC, so nothing was copied.",
                     L"AppSandbox", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
         goto out;
     }
     if (!clip_downloads_dir(dest)) {
-        clip_log("Large paste: no Downloads folder for the logged-in user.");
+        MessageBoxW(NULL, L"Couldn't find your Downloads folder, so nothing was copied.",
+                    L"AppSandbox", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
         goto out;
     }
     clip_fmt_gb(size.bytes, gb, 32);
@@ -809,6 +821,7 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
 
             clip_free_pending();
             g_clip_fmt_count = 0;
+            InterlockedExchange(&g_large_asked, 0);   /* new PC clipboard */
             for (i = 0; i < count && off + 8 <= (int)hdr.data_size; i++) {
                 UINT32 fmt_id   = *(UINT32 *)(buf + off); off += 4;
                 UINT32 name_len = *(UINT32 *)(buf + off); off += 4;

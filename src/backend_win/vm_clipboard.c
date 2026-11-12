@@ -55,6 +55,12 @@ static const GUID CLIPBOARD_READER_SERVICE_GUID =
 #define CLIP_MSG_FORMAT_DATA_REQ  2
 #define CLIP_MSG_FORMAT_DATA_RESP 3
 #define CLIP_MSG_FILE_DATA        4
+/* Fork: the guest asks for the total size of the host's CF_HDROP before fetching it on paste. */
+#define CLIP_MSG_FILE_SIZE_REQ    5
+#define CLIP_MSG_FILE_SIZE_RESP   6
+/* Fork: DATA_REQ format flag: the user confirmed a paste over CLIP_FILE_PUSH_LIMIT. */
+#define CLIP_FMT_CONFIRMED        0x80000000u
+#define CLIP_FILE_PUSH_LIMIT      (1ull << 30)
 /* CLIP_MSG_SYNC_ENABLE = 12 (defined in header) */
 
 #define CLIP_MAX_FORMATS    64
@@ -76,6 +82,12 @@ typedef struct {
     UINT64 file_size;
     UINT8  is_directory;
 } ClipFileInfo;
+
+typedef struct {
+    UINT64 bytes;
+    UINT32 files;
+    UINT32 over;   /* 1 = bytes passed the requested limit; counting stopped there */
+} ClipSizeResp;
 #pragma pack(pop)
 
 typedef struct {
@@ -103,6 +115,11 @@ struct VmClipboardData {
     volatile LONG    writer_suppress;
     HANDLE           writer_thread;
     CRITICAL_SECTION writer_cs;
+    /* Fork: a file stream owns writer_cs. Sends from the window thread are deferred
+       instead of waiting for it, so a big transfer can't freeze the viewer. */
+    volatile LONG    streaming;
+    volatile LONG    deferred_sync;
+    volatile LONG    deferred_list;
 
     /* Reader channel (:0006 guest->host) */
     volatile SOCKET  reader_socket;
@@ -428,6 +445,23 @@ static HGLOBAL clip_build_hdrop_from_temp(const wchar_t *temp_dir)
     return hMem;
 }
 
+/* ---- Writer lock (fork) ---- */
+
+/* Take writer_cs for a short send from the window thread. Returns FALSE, and marks
+   *deferred, while a file stream owns the lock; the stream sends it when it ends. */
+static BOOL clip_writer_lock(VmClipboard clip, volatile LONG *deferred)
+{
+    for (;;) {
+        if (TryEnterCriticalSection(&clip->writer_cs)) return TRUE;
+        if (InterlockedOr(&clip->streaming, 0)) {
+            InterlockedExchange(deferred, 1);
+            if (InterlockedOr(&clip->streaming, 0)) return FALSE;
+            InterlockedExchange(deferred, 0);   /* stream just ended: send it ourselves */
+        }
+        SwitchToThread();
+    }
+}
+
 /* ---- Writer channel: send SYNC_ENABLE ---- */
 
 static void clip_send_sync_enable(VmClipboard clip, BOOL enabled)
@@ -443,7 +477,10 @@ static void clip_send_sync_enable(VmClipboard clip, BOOL enabled)
     hdr.format = 0;
     hdr.data_size = 1;
 
-    EnterCriticalSection(&clip->writer_cs);
+    if (!clip_writer_lock(clip, &clip->deferred_sync)) {
+        clip_log(clip, L"CLIP: SYNC_ENABLE(%d) deferred until the file transfer ends.", (int)flag);
+        return;
+    }
     clip_send_all(s, &hdr, sizeof(hdr));
     clip_send_all(s, &flag, 1);
     LeaveCriticalSection(&clip->writer_cs);
@@ -502,9 +539,11 @@ static void clip_send_format_list(VmClipboard clip)
     hdr.format = 0;
     hdr.data_size = (UINT32)offset;
 
+    if (!clip_writer_lock(clip, &clip->deferred_list)) {
+        clip_log(clip, L"CLIP: Format list deferred until the file transfer ends.");
+        return;
+    }
     InterlockedExchange(&clip->reader_suppress, 1);
-
-    EnterCriticalSection(&clip->writer_cs);
     clip_send_all(s, &hdr, sizeof(hdr));
     clip_send_all(s, buf, offset);
     LeaveCriticalSection(&clip->writer_cs);
@@ -512,16 +551,91 @@ static void clip_send_format_list(VmClipboard clip)
     clip_log(clip, L"CLIP: Sent format list (%u formats) to guest.", count);
 }
 
+/* ---- Host file list helpers (fork) ---- */
+
+/* Copy the CF_HDROP paths (MAX_PATH each) so the host clipboard isn't held open
+   for the whole transfer. Returns NULL when the clipboard has no files. */
+static wchar_t *clip_copy_hdrop_paths(UINT *count)
+{
+    wchar_t *paths = NULL;
+    HANDLE hData;
+    *count = 0;
+    if (!OpenClipboard(NULL)) return NULL;
+    hData = GetClipboardData(CF_HDROP);
+    if (hData) {
+        UINT n = DragQueryFileW((HDROP)hData, 0xFFFFFFFF, NULL, 0), i;
+        if (n) paths = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                            (SIZE_T)n * MAX_PATH * sizeof(wchar_t));
+        if (paths) {
+            for (i = 0; i < n; i++) DragQueryFileW((HDROP)hData, i, paths + (SIZE_T)i * MAX_PATH, MAX_PATH);
+            *count = n;
+        }
+    }
+    CloseClipboard();
+    return paths;
+}
+
+/* Add path's size (recursively) to *bytes/*files. Stops once *bytes passes limit (0 = no limit). */
+static void clip_measure(const wchar_t *path, UINT64 limit, UINT64 *bytes, UINT32 *files)
+{
+    WIN32_FIND_DATAW fd;
+    wchar_t search[MAX_PATH];
+    HANDLE h;
+    DWORD attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (limit && *bytes > limit)) return;
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        if (GetFileAttributesExW(path, GetFileExInfoStandard, &a)) {
+            *bytes += ((UINT64)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+            (*files)++;
+        }
+        return;
+    }
+    swprintf_s(search, MAX_PATH, L"%s\\*", path);
+    h = FindFirstFileW(search, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        wchar_t child[MAX_PATH];
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            swprintf_s(child, MAX_PATH, L"%s\\%s", path, fd.cFileName);
+            clip_measure(child, limit, bytes, files);
+        } else {
+            *bytes += ((UINT64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            (*files)++;
+        }
+    } while ((!limit || *bytes <= limit) && FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void clip_measure_paths(const wchar_t *paths, UINT count, UINT64 limit, ClipSizeResp *r)
+{
+    UINT i;
+    ZeroMemory(r, sizeof(*r));
+    for (i = 0; i < count && (!limit || r->bytes <= limit); i++)
+        clip_measure(paths + (SIZE_T)i * MAX_PATH, limit, &r->bytes, &r->files);
+    r->over = limit && r->bytes > limit;
+}
+
+/* Send what the window thread had to defer during a file stream. Writer thread only. */
+static void clip_flush_deferred(VmClipboard clip)
+{
+    if (InterlockedExchange(&clip->deferred_sync, 0)) clip_send_sync_enable(clip, clip->sync_enabled);
+    if (InterlockedExchange(&clip->deferred_list, 0) && clip->sync_enabled) clip_send_format_list(clip);
+}
+
 /* ---- Writer channel: handle DATA_REQ from guest ---- */
 
-static void clip_handle_data_request(VmClipboard clip, UINT fmt)
+static void clip_handle_data_request(VmClipboard clip, UINT request)
 {
     ClipHeader hdr;
     SOCKET s = clip->writer_socket;
+    BOOL confirmed = (request & CLIP_FMT_CONFIRMED) != 0;
+    UINT fmt = request & ~CLIP_FMT_CONFIRMED;
 
     if (s == INVALID_SOCKET) return;
 
-    clip_log(clip, L"CLIP: Data request from guest for format %u.", fmt);
+    clip_log(clip, L"CLIP: Data request from guest for format %u%s.", fmt, confirmed ? L" (confirmed)" : L"");
 
     /* When sync is disabled, return empty — don't leak host clipboard. */
     if (!clip->sync_enabled) {
@@ -536,35 +650,37 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
     }
 
     if (fmt == CF_HDROP) {
-        if (OpenClipboard(NULL)) {
-            HANDLE hData = GetClipboardData(CF_HDROP);
-            if (hData) {
-                HDROP hDrop = (HDROP)hData;
-                UINT file_count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
-                UINT fi;
-                EnterCriticalSection(&clip->writer_cs);
-                for (fi = 0; fi < file_count; fi++) {
-                    wchar_t path[MAX_PATH];
-                    wchar_t *name;
-                    DragQueryFileW(hDrop, fi, path, MAX_PATH);
-                    name = wcsrchr(path, L'\\');
-                    name = name ? name + 1 : path;
-                    clip_send_file_entry(s, path, name);
-                }
-                hdr.magic = CLIP_MAGIC;
-                hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-                hdr.format = CF_HDROP;
-                hdr.data_size = 0;
-                clip_send_all(s, &hdr, sizeof(hdr));
-                LeaveCriticalSection(&clip->writer_cs);
-            } else {
-                CloseClipboard();
+        UINT file_count, fi;
+        wchar_t *paths = clip_copy_hdrop_paths(&file_count);
+        if (!paths) goto send_empty;
+        if (!confirmed) {
+            ClipSizeResp size;
+            clip_measure_paths(paths, file_count, CLIP_FILE_PUSH_LIMIT, &size);
+            if (size.over) {
+                clip_log(clip, L"CLIP: Files over 1 GB not sent to guest without confirmation.");
+                HeapFree(GetProcessHeap(), 0, paths);
                 goto send_empty;
             }
-            CloseClipboard();
-        } else {
-            goto send_empty;
         }
+        clip_log(clip, L"CLIP: Sending %u item(s) to guest...", file_count);
+        InterlockedExchange(&clip->streaming, 1);
+        EnterCriticalSection(&clip->writer_cs);
+        for (fi = 0; fi < file_count; fi++) {
+            wchar_t *path = paths + (SIZE_T)fi * MAX_PATH;
+            wchar_t *name = wcsrchr(path, L'\\');
+            name = name ? name + 1 : path;
+            if (!clip_send_file_entry(s, path, name)) break;
+        }
+        hdr.magic = CLIP_MAGIC;
+        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
+        hdr.format = CF_HDROP;
+        hdr.data_size = 0;
+        clip_send_all(s, &hdr, sizeof(hdr));
+        LeaveCriticalSection(&clip->writer_cs);
+        InterlockedExchange(&clip->streaming, 0);
+        HeapFree(GetProcessHeap(), 0, paths);
+        clip_log(clip, L"CLIP: File transfer to guest finished.");
+        clip_flush_deferred(clip);
         return;
 
     send_empty:
@@ -609,23 +725,61 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
 
 /* ---- Writer recv thread ---- */
 
+static BOOL clip_skip_payload(SOCKET s, UINT32 remaining)
+{
+    BYTE skip[256];
+    while (remaining > 0) {
+        int chunk = remaining > 256 ? 256 : (int)remaining;
+        if (!clip_recv_exact(s, skip, chunk)) return FALSE;
+        remaining -= chunk;
+    }
+    return TRUE;
+}
+
+/* Fork: reply with the size of the host's CF_HDROP, counting at most up to the guest's limit. */
+static BOOL clip_handle_size_request(VmClipboard clip, SOCKET s, const ClipHeader *hdr)
+{
+    UINT64 limit = 0;
+    UINT32 used = 0;
+    ClipSizeResp resp = {0};
+    ClipHeader out;
+    UINT count = 0;
+    wchar_t *paths;
+
+    if (hdr->data_size >= sizeof(limit)) {
+        if (!clip_recv_exact(s, &limit, sizeof(limit))) return FALSE;
+        used = sizeof(limit);
+    }
+    if (!clip_skip_payload(s, hdr->data_size - used)) return FALSE;
+
+    paths = clip->sync_enabled ? clip_copy_hdrop_paths(&count) : NULL;
+    if (paths) {
+        clip_measure_paths(paths, count, limit, &resp);
+        HeapFree(GetProcessHeap(), 0, paths);
+    }
+    out.magic = CLIP_MAGIC;
+    out.msg_type = CLIP_MSG_FILE_SIZE_RESP;
+    out.format = CF_HDROP;
+    out.data_size = sizeof(resp);
+    EnterCriticalSection(&clip->writer_cs);
+    clip_send_all(s, &out, sizeof(out));
+    clip_send_all(s, &resp, sizeof(resp));
+    LeaveCriticalSection(&clip->writer_cs);
+    clip_log(clip, L"CLIP: File size for guest: %llu bytes, %u files%s.",
+             resp.bytes, resp.files, resp.over ? L" (over limit)" : L"");
+    return TRUE;
+}
+
 static BOOL clip_writer_handle_message(VmClipboard clip, SOCKET s, const ClipHeader *hdr)
 {
     switch (hdr->msg_type) {
     case CLIP_MSG_FORMAT_DATA_REQ:
         clip_handle_data_request(clip, hdr->format);
         return TRUE;
+    case CLIP_MSG_FILE_SIZE_REQ:
+        return clip_handle_size_request(clip, s, hdr);
     default:
-        if (hdr->data_size > 0) {
-            BYTE skip[256];
-            UINT32 remaining = hdr->data_size;
-            while (remaining > 0) {
-                int chunk = remaining > 256 ? 256 : (int)remaining;
-                if (!clip_recv_exact(s, skip, chunk)) return FALSE;
-                remaining -= chunk;
-            }
-        }
-        return TRUE;
+        return clip_skip_payload(s, hdr->data_size);
     }
 }
 

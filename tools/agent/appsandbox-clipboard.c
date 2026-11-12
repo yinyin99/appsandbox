@@ -59,12 +59,23 @@ static const GUID CLIPBOARD_SERVICE_GUID =
 #define CLIP_MSG_FORMAT_DATA_REQ  2
 #define CLIP_MSG_FORMAT_DATA_RESP 3
 #define CLIP_MSG_FILE_DATA        4
+#define CLIP_MSG_FILE_SIZE_REQ    5   /* fork: ask the host how big its CF_HDROP is */
+#define CLIP_MSG_FILE_SIZE_RESP   6
+#define CLIP_FMT_CONFIRMED        0x80000000u  /* fork: DATA_REQ flag, user confirmed a large copy */
 #define CLIP_MSG_SYNC_ENABLE      12
 
 #define CLIP_MAX_FORMATS    64
 #define CLIP_MAX_PAYLOAD    (64 * 1024 * 1024)  /* 64 MB */
 
 #define WM_CLIP_APPLY_FMTS (WM_USER + 200)
+#define WM_CLIP_LARGE_PASTE (WM_USER + 201)
+#define WM_CLIP_XFER_DONE   (WM_USER + 202)
+
+/* Fork: files are fetched only when something pastes them. Windows waits 30 s for
+   WM_RENDERFORMAT, so pastes over the limit ask first and land in Downloads\From PC. */
+#define CLIP_PASTE_LIMIT        (1ull << 30)
+#define CLIP_RENDER_BUDGET_MS   25000
+#define CLIP_SIZE_QUICK_MS      3000
 
 #pragma pack(push, 1)
 typedef struct {
@@ -94,6 +105,12 @@ typedef struct {
     UINT64 file_size;    /* file data bytes that follow (0 for directories) */
     UINT8  is_directory; /* 1 = directory entry, 0 = regular file */
 } ClipFileInfo;
+
+typedef struct {
+    UINT64 bytes;
+    UINT32 files;
+    UINT32 over;
+} ClipSizeResp;
 #pragma pack(pop)
 
 /* Format data: filled by recv thread, applied by wndproc */
@@ -115,6 +132,16 @@ static HANDLE g_sync_event = NULL;
 /* Socket shared between threads */
 static AsbConn * volatile g_client_sock = NULL;
 static CRITICAL_SECTION g_send_cs;
+
+/* Fork: paste-time file transfer state. */
+enum { XFER_NONE, XFER_SYNC, XFER_DETACHED, XFER_DONE };
+static volatile LONG g_xfer = XFER_NONE;      /* SYNC = a paste waits; DETACHED = goes to Downloads */
+static volatile LONG g_xfer_ok = 0;
+static HANDLE        g_xfer_event = NULL;     /* set when a SYNC transfer ends */
+static HANDLE        g_size_event = NULL;
+static ClipSizeResp  g_size;
+static volatile LONG g_large_pending = 0;     /* the large-paste dialog is open or queued */
+static wchar_t       g_xfer_dest[MAX_PATH];
 
 /* Message window (created on msg_window_thread) */
 static HWND g_msg_hwnd = NULL;
@@ -309,6 +336,12 @@ static void clip_request_next_format(void)
 {
     ClipHeader hdr;
 
+    /* Fork: never fetch files up front; they are fetched on paste (clip_render_hdrop). */
+    while (g_clip_fetch_idx < g_clip_fmt_count && g_clip_fmts[g_clip_fetch_idx].remote_id == CF_HDROP) {
+        g_clip_fmts[g_clip_fetch_idx].is_hdrop = TRUE;
+        g_clip_fetch_idx++;
+    }
+
     if (g_clip_fetch_idx >= g_clip_fmt_count) {
         /* All formats fetched — tell msg window to apply */
         clip_log("All %d formats fetched, applying.", g_clip_fmt_count);
@@ -353,9 +386,8 @@ static void clip_apply_format_list(void)
 
     for (i = 0; i < g_clip_fmt_count; i++) {
         if (g_clip_fmts[i].is_hdrop) {
-            HGLOBAL hDrop = clip_build_hdrop_from_temp();
-            if (hDrop)
-                SetClipboardData(g_clip_fmts[i].local_id, hDrop);
+            /* Fork: delayed rendering; WM_RENDERFORMAT fetches the files on paste. */
+            SetClipboardData(g_clip_fmts[i].local_id, NULL);
         } else if (g_clip_fmts[i].data && g_clip_fmts[i].data_size > 0) {
             HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, g_clip_fmts[i].data_size);
             if (hMem) {
@@ -376,6 +408,209 @@ static void clip_apply_format_list(void)
     clip_free_pending();
 }
 
+/* ---- Paste-time file transfer (fork) ---- */
+
+static BOOL clip_send_msg(UINT32 type, UINT32 format, const void *payload, UINT32 size)
+{
+    ClipHeader hdr;
+    BOOL ok;
+    hdr.magic = CLIP_MAGIC;
+    hdr.msg_type = type;
+    hdr.format = format;
+    hdr.data_size = size;
+    EnterCriticalSection(&g_send_cs);
+    ok = send_all_locked(&hdr, sizeof(hdr)) && (!size || send_all_locked(payload, (int)size));
+    LeaveCriticalSection(&g_send_cs);
+    return ok;
+}
+
+/* Ask the host for the size of its files, counting at most to limit (0 = all). */
+static BOOL clip_query_size(UINT64 limit, ClipSizeResp *out, DWORD timeout_ms)
+{
+    ResetEvent(g_size_event);
+    if (!clip_send_msg(CLIP_MSG_FILE_SIZE_REQ, CF_HDROP, &limit, sizeof(limit))) return FALSE;
+    if (WaitForSingleObject(g_size_event, timeout_ms) != WAIT_OBJECT_0) return FALSE;
+    *out = g_size;
+    return TRUE;
+}
+
+/* %USERPROFILE%\Downloads\From PC of the logged-in user.
+   shortcut: ignores a relocated Downloads folder; use SHGetKnownFolderPath if someone moves it. */
+static BOOL clip_downloads_dir(wchar_t *out)
+{
+    DWORD session_id = WTSGetActiveConsoleSessionId();
+    HANDLE token = NULL;
+    BOOL ok;
+    if (session_id == 0xFFFFFFFF || !WTSQueryUserToken(session_id, &token)) return FALSE;
+    ok = ExpandEnvironmentStringsForUserW(token, L"%USERPROFILE%\\Downloads\\From PC", out, MAX_PATH);
+    CloseHandle(token);
+    if (ok) CreateDirectoryW(out, NULL);
+    return ok;
+}
+
+/* dir\name, or "name (2).ext" ... when taken. */
+static BOOL clip_free_name(const wchar_t *dir, const wchar_t *name, BOOL is_dir, wchar_t *out)
+{
+    wchar_t base[MAX_PATH];
+    const wchar_t *ext = is_dir ? NULL : wcsrchr(name, L'.');
+    int n;
+    swprintf_s(out, MAX_PATH, L"%s\\%s", dir, name);
+    if (GetFileAttributesW(out) == INVALID_FILE_ATTRIBUTES) return TRUE;
+    wcsncpy_s(base, MAX_PATH, name, ext ? (size_t)(ext - name) : _TRUNCATE);
+    for (n = 2; n < 1000; n++) {
+        swprintf_s(out, MAX_PATH, L"%s\\%s (%d)%s", dir, base, n, ext ? ext : L"");
+        if (GetFileAttributesW(out) == INVALID_FILE_ATTRIBUTES) return TRUE;
+    }
+    return FALSE;
+}
+
+/* Move everything the host sent from the temp dir into Downloads\From PC. */
+static BOOL clip_move_to_downloads(void)
+{
+    WIN32_FIND_DATAW fd;
+    wchar_t pattern[MAX_PATH];
+    HANDLE h;
+    BOOL ok = TRUE;
+    if (!clip_downloads_dir(g_xfer_dest)) return FALSE;
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", g_clip_temp_dir);
+    h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        wchar_t src[MAX_PATH], dst[MAX_PATH];
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        swprintf_s(src, MAX_PATH, L"%s\\%s", g_clip_temp_dir, fd.cFileName);
+        if (!clip_free_name(g_xfer_dest, fd.cFileName, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, dst) ||
+            !MoveFileExW(src, dst, MOVEFILE_COPY_ALLOWED)) {
+            clip_log("Move to Downloads failed for %ls (%lu).", fd.cFileName, GetLastError());
+            ok = FALSE;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
+}
+
+/* Recv thread: the host's file stream for a paste ended (or the connection dropped). */
+static void clip_xfer_finished(BOOL ok)
+{
+    LONG prev;
+    InterlockedExchange(&g_xfer_ok, ok);
+    prev = InterlockedCompareExchange(&g_xfer, XFER_DONE, XFER_SYNC);
+    if (prev == XFER_SYNC) {
+        SetEvent(g_xfer_event);
+    } else if (prev == XFER_DETACHED) {
+        BOOL moved = ok && clip_move_to_downloads();
+        clip_remove_dir_recursive(g_clip_temp_dir);
+        CreateDirectoryW(g_clip_temp_dir, NULL);
+        InterlockedExchange(&g_xfer, XFER_NONE);
+        if (g_msg_hwnd) PostMessageW(g_msg_hwnd, WM_CLIP_XFER_DONE, moved, 0);
+    }
+}
+
+/* WM_RENDERFORMAT(CF_HDROP): an app is pasting the host's files. Must answer within 30 s
+   and must not open the clipboard (SetClipboardData directly). */
+static void clip_render_hdrop(void)
+{
+    ClipSizeResp size = {0};
+    ULONGLONG start = GetTickCount64(), spent;
+    DWORD wait;
+
+    if (g_xfer != XFER_NONE || g_large_pending) {
+        clip_log("Paste ignored: a copy from the PC is already running.");
+        return;
+    }
+    /* No answer = old host; it then refuses over 1 GB itself. */
+    clip_query_size(CLIP_PASTE_LIMIT, &size, CLIP_SIZE_QUICK_MS);
+    if (size.over) {
+        clip_log("Paste of more than 1 GB: asking before copying to Downloads.");
+        InterlockedExchange(&g_large_pending, 1);
+        PostMessageW(g_msg_hwnd, WM_CLIP_LARGE_PASTE, 0, 0);
+        return;
+    }
+
+    clip_remove_dir_recursive(g_clip_temp_dir);
+    CreateDirectoryW(g_clip_temp_dir, NULL);
+    ResetEvent(g_xfer_event);
+    InterlockedExchange(&g_xfer, XFER_SYNC);
+    if (!clip_send_msg(CLIP_MSG_FORMAT_DATA_REQ, CF_HDROP, NULL, 0)) {
+        InterlockedExchange(&g_xfer, XFER_NONE);
+        return;
+    }
+    spent = GetTickCount64() - start;
+    wait = spent < CLIP_RENDER_BUDGET_MS ? (DWORD)(CLIP_RENDER_BUDGET_MS - spent) : 0;
+    if (WaitForSingleObject(g_xfer_event, wait) != WAIT_OBJECT_0 &&
+        InterlockedCompareExchange(&g_xfer, XFER_DETACHED, XFER_SYNC) == XFER_SYNC) {
+        clip_log("Paste still copying after %u s; it continues into Downloads\\From PC.", CLIP_RENDER_BUDGET_MS / 1000);
+        return;
+    }
+    InterlockedExchange(&g_xfer, XFER_NONE);
+    if (g_xfer_ok) {
+        HGLOBAL h = clip_build_hdrop_from_temp();
+        if (h && !SetClipboardData(CF_HDROP, h)) GlobalFree(h);
+        clip_log("Pasted files from the PC.");
+    }
+}
+
+static void clip_fmt_gb(UINT64 bytes, wchar_t *out, size_t n)
+{
+    swprintf_s(out, n, L"%.1f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+}
+
+/* Message thread: ask before copying a paste over the limit into Downloads\From PC. */
+static void clip_large_paste(void)
+{
+    ClipSizeResp size;
+    ULARGE_INTEGER free_bytes;
+    wchar_t dest[MAX_PATH], gb[32], free_gb[32], msg[1024];
+
+    if (!clip_query_size(0, &size, 120000) || !size.bytes) {
+        MessageBoxW(NULL, L"Couldn't read the size of the files on the PC, so nothing was copied.",
+                    L"AppSandbox", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+        goto out;
+    }
+    if (!clip_downloads_dir(dest)) {
+        clip_log("Large paste: no Downloads folder for the logged-in user.");
+        goto out;
+    }
+    clip_fmt_gb(size.bytes, gb, 32);
+    /* Keep 2 GB spare so a big copy can't fill the VM's disk. */
+    if (GetDiskFreeSpaceExW(dest, &free_bytes, NULL, NULL) &&
+        free_bytes.QuadPart < size.bytes + (2ull << 30)) {
+        clip_fmt_gb(free_bytes.QuadPart, free_gb, 32);
+        swprintf_s(msg, 1024, L"Not enough space in this VM to copy %s (%u files) from the PC.\n\nFree: %s. Nothing was copied.",
+                   gb, size.files, free_gb);
+        MessageBoxW(NULL, msg, L"AppSandbox", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+        goto out;
+    }
+    swprintf_s(msg, 1024, L"Copy %s (%u files) from the PC into this VM?\n\n"
+               L"That's too large to paste directly. The files will be copied to:\n%s\n\n"
+               L"You'll get a message when it's done.", gb, size.files, dest);
+    if (MessageBoxW(NULL, msg, L"AppSandbox", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST) != IDYES)
+        goto out;
+    if (g_xfer != XFER_NONE) goto out;
+
+    clip_remove_dir_recursive(g_clip_temp_dir);
+    CreateDirectoryW(g_clip_temp_dir, NULL);
+    InterlockedExchange(&g_xfer, XFER_DETACHED);
+    if (!clip_send_msg(CLIP_MSG_FORMAT_DATA_REQ, CF_HDROP | CLIP_FMT_CONFIRMED, NULL, 0)) {
+        InterlockedExchange(&g_xfer, XFER_NONE);
+        MessageBoxW(NULL, L"Lost the connection to the PC; nothing was copied.",
+                    L"AppSandbox", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+    } else {
+        clip_log("Large paste confirmed: copying %llu bytes to %ls.", size.bytes, dest);
+    }
+out:
+    InterlockedExchange(&g_large_pending, 0);
+}
+
+static void clip_notify_done(BOOL ok)
+{
+    wchar_t msg[MAX_PATH + 128];
+    if (ok) swprintf_s(msg, ARRAYSIZE(msg), L"Done. The files from the PC are in:\n%s", g_xfer_dest);
+    else wcscpy_s(msg, ARRAYSIZE(msg), L"Copying the files from the PC failed or was interrupted.");
+    clip_log("Large paste finished: %s.", ok ? "ok" : "failed");
+    MessageBoxW(NULL, msg, L"AppSandbox", MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONWARNING) | MB_SETFOREGROUND | MB_TOPMOST);
+}
+
 /* ---- Message window for clipboard monitoring ---- */
 
 static LRESULT CALLBACK clip_msg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -384,6 +619,15 @@ static LRESULT CALLBACK clip_msg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
     case WM_CLIP_APPLY_FMTS:
         clip_log("WM_CLIP_APPLY_FMTS — applying fetched data.");
         clip_apply_format_list();
+        return 0;
+    case WM_RENDERFORMAT:
+        if (wp == CF_HDROP) clip_render_hdrop();
+        return 0;
+    case WM_CLIP_LARGE_PASTE:
+        clip_large_paste();
+        return 0;
+    case WM_CLIP_XFER_DONE:
+        clip_notify_done((BOOL)wp);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -595,9 +839,11 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
 
             clip_log("Received format list (%u formats), fetching data...", g_clip_fmt_count);
 
-            /* Clean temp dir for potential file transfers */
-            clip_remove_dir_recursive(g_clip_temp_dir);
-            CreateDirectoryW(g_clip_temp_dir, NULL);
+            /* Clean temp dir for potential file transfers (not while a paste is still copying) */
+            if (g_xfer == XFER_NONE) {
+                clip_remove_dir_recursive(g_clip_temp_dir);
+                CreateDirectoryW(g_clip_temp_dir, NULL);
+            }
 
             /* Start fetching format data one at a time */
             clip_request_next_format();
@@ -607,6 +853,13 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
         case CLIP_MSG_FORMAT_DATA_RESP: {
             int idx = g_clip_fetch_idx;
             clip_log("Data response for format %u (%u bytes).", hdr.format, hdr.data_size);
+
+            /* Fork: end marker of a paste-time file transfer. */
+            if (hdr.format == CF_HDROP && hdr.data_size == 0 &&
+                (g_xfer == XFER_SYNC || g_xfer == XFER_DETACHED)) {
+                clip_xfer_finished(TRUE);
+                break;
+            }
 
             if (idx >= 0 && idx < g_clip_fmt_count) {
                 if (hdr.format == CF_HDROP && hdr.data_size == 0) {
@@ -630,6 +883,24 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
             CreateDirectoryW(g_clip_temp_dir, NULL);
             if (!clip_recv_file_data(s, &hdr)) goto done;
             break;
+
+        case CLIP_MSG_FILE_SIZE_RESP: {
+            ClipSizeResp r = {0};
+            UINT32 used = 0;
+            BYTE skip[256];
+            if (hdr.data_size >= sizeof(r)) {
+                if (!recv_exact(s, &r, sizeof(r))) goto done;
+                used = sizeof(r);
+            }
+            while (used < hdr.data_size) {
+                int c = hdr.data_size - used > sizeof(skip) ? (int)sizeof(skip) : (int)(hdr.data_size - used);
+                if (!recv_exact(s, skip, c)) goto done;
+                used += c;
+            }
+            g_size = r;
+            SetEvent(g_size_event);
+            break;
+        }
 
         default:
             clip_log("Unknown msg_type %u.", hdr.msg_type);
@@ -682,6 +953,7 @@ static void handle_client(AsbConn *s)
     g_client_sock = NULL;
     clip_free_pending();
     g_clip_fmt_count = 0;
+    if (g_xfer == XFER_SYNC || g_xfer == XFER_DETACHED) clip_xfer_finished(FALSE);
     clip_remove_dir_recursive(g_clip_temp_dir);
     clip_log("Client disconnected.");
 }
@@ -701,6 +973,8 @@ int main(void)
     g_clip_fetch_idx = 0;
     clip_init_temp_dir();
 
+    g_xfer_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_size_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_sync_event = CreateEventW(NULL, TRUE, FALSE, CLIP_SYNC_EVENT_NAME);
     if (!g_sync_event)
         clip_log("Warning: failed to create sync event (%lu).", GetLastError());
